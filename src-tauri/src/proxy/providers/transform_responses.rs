@@ -2119,23 +2119,41 @@ fn responses_error_message(body: &Value, fallback: &str) -> String {
         .to_string()
 }
 
+/// Extract the upstream error type from a Responses failure envelope.
+///
+/// The type can live under `error.type`, `error.code`, or (for terminal
+/// statuses without an error object) the response status itself.
+fn responses_error_signal<'a>(body: &'a Value, fallback: &'a str) -> &'a str {
+    body.pointer("/error/type")
+        .and_then(Value::as_str)
+        .or_else(|| body.pointer("/error/code").and_then(Value::as_str))
+        .or_else(|| body.get("status").and_then(Value::as_str))
+        .unwrap_or(fallback)
+}
+
 fn validate_responses_terminal_status(body: &Value) -> Result<(), ProxyError> {
     let status = body.get("status").and_then(Value::as_str);
     let has_error = body.get("error").is_some_and(|error| !error.is_null());
 
     match status {
-        Some("failed") => Err(ProxyError::TransformError(format!(
-            "Responses upstream failed: {}",
-            responses_error_message(body, "response generation failed")
-        ))),
+        Some("failed") => {
+            let message = responses_error_message(body, "response generation failed");
+            Err(ProxyError::responses_upstream_failure(
+                responses_error_signal(body, "failed"),
+                &message,
+            ))
+        }
         Some("cancelled") => Err(ProxyError::TransformError(format!(
             "Responses upstream cancelled the response: {}",
             responses_error_message(body, "response generation was cancelled")
         ))),
-        _ if has_error => Err(ProxyError::TransformError(format!(
-            "Responses upstream returned an error envelope: {}",
-            responses_error_message(body, "unknown upstream error")
-        ))),
+        _ if has_error => {
+            let message = responses_error_message(body, "unknown upstream error");
+            Err(ProxyError::responses_upstream_failure(
+                responses_error_signal(body, "upstream_error"),
+                &message,
+            ))
+        }
         _ => Ok(()),
     }
 }
@@ -4860,9 +4878,14 @@ mod tests {
         });
 
         let error = responses_to_anthropic(input).unwrap_err();
-        assert!(
-            matches!(error, ProxyError::TransformError(message) if message.contains("too many requests"))
-        );
+        match error {
+            ProxyError::UpstreamError { status, body } => {
+                assert_eq!(status, 429);
+                let body = body.unwrap_or_default();
+                assert!(body.contains("too many requests") || body.contains("rate_limit"));
+            }
+            other => panic!("expected rate-limit UpstreamError 429, got {other:?}"),
+        }
     }
 
     #[test]

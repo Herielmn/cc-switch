@@ -6,6 +6,29 @@ use axum::{
 use serde_json::json;
 use thiserror::Error;
 
+/// Rate-limit signals that must surface as HTTP 429, not 422.
+///
+/// `too_many_requests` is the OpenAI/Azure Responses code; the rest cover
+/// relay and gateway phrasings seen in upstream error envelopes.
+pub fn is_rate_limit_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("too_many_requests")
+        || lower.contains("too many requests")
+        || lower.contains("rate_limit")
+        || lower.contains("rate limit")
+}
+
+/// Map a transform/conversion error message to the HTTP status the client
+/// must see. Rate limits are 429 so Claude Code and other clients retry
+/// instead of treating the payload as a permanent format failure.
+pub fn transform_error_status(message: &str) -> StatusCode {
+    if is_rate_limit_error(message) {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ProxyError {
     #[error("上游响应体超过大小上限: {0} 字节")]
@@ -147,8 +170,8 @@ impl IntoResponse for ProxyError {
                         (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
                     }
                     ProxyError::ConfigError(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-                    ProxyError::TransformError(_) => {
-                        (StatusCode::UNPROCESSABLE_ENTITY, self.to_string())
+                    ProxyError::TransformError(msg) => {
+                        (transform_error_status(msg), self.to_string())
                     }
                     ProxyError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
                     ProxyError::Timeout(_) => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
@@ -177,6 +200,33 @@ impl IntoResponse for ProxyError {
         };
 
         (status, Json(body)).into_response()
+    }
+}
+
+impl ProxyError {
+    /// Build the client-facing error for a Responses upstream failure envelope.
+    /// Rate-limit envelopes become `UpstreamError { status: 429 }`; anything
+    /// else stays a transform error (real conversion bugs are still 422).
+    pub fn responses_upstream_failure(error_type: &str, message: &str) -> Self {
+        let signal = format!("{error_type} {message}");
+        if is_rate_limit_error(&signal) {
+            ProxyError::UpstreamError {
+                status: 429,
+                body: Some(
+                    json!({
+                        "error": {
+                            "type": "rate_limit_error",
+                            "code": "too_many_requests",
+                            "message": message,
+                            "upstream_type": error_type,
+                        }
+                    })
+                    .to_string(),
+                ),
+            }
+        } else {
+            ProxyError::TransformError(format!("Responses upstream {error_type}: {message}"))
+        }
     }
 }
 

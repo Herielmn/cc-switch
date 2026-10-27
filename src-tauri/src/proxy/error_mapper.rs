@@ -2,6 +2,7 @@
 //!
 //! 将 ProxyError 映射到合适的 HTTP 状态码，用于日志记录和手动构建错误响应
 
+use super::error::{is_rate_limit_error, transform_error_status};
 use super::ProxyError;
 
 /// 将 ProxyError 映射到 HTTP 状态码
@@ -55,8 +56,8 @@ pub fn map_proxy_error_to_status(error: &ProxyError) -> u16 {
         // 数据库错误：500 Internal Server Error
         ProxyError::DatabaseError(_) => 500,
 
-        // 转换错误：422 Unprocessable Entity
-        ProxyError::TransformError(_) => 422,
+        // 转换错误：默认 422；限流类消息必须 429，避免客户端误判为不可重试格式错误
+        ProxyError::TransformError(msg) => transform_error_status(msg).as_u16(),
 
         // 其他未知错误：500 Internal Server Error
         _ => 500,
@@ -83,7 +84,13 @@ pub fn get_error_message(error: &ProxyError) -> String {
         ProxyError::MaxRetriesExceeded => "所有 Provider 都失败，重试耗尽".to_string(),
         ProxyError::ProviderUnhealthy(msg) => format!("Provider 不健康: {msg}"),
         ProxyError::DatabaseError(msg) => format!("数据库错误: {msg}"),
-        ProxyError::TransformError(msg) => format!("请求/响应转换错误: {msg}"),
+        ProxyError::TransformError(msg) => {
+            if is_rate_limit_error(msg) {
+                format!("上游限流: {msg}")
+            } else {
+                format!("请求/响应转换错误: {msg}")
+            }
+        }
         _ => error.to_string(),
     }
 }

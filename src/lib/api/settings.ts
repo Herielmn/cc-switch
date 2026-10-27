@@ -401,6 +401,8 @@ export interface RectifierConfig {
   requestThinkingBudget: boolean;
   requestMediaFallback: boolean;
   requestMediaHeuristic: boolean;
+  /** Azure 跨资源条目剥离：上游报 created under a different ... resource 时去掉条目 id 并重试一次 */
+  requestAzureForeignResourceStrip: boolean;
 }
 
 export interface OptimizerConfig {

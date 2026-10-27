@@ -17,6 +17,7 @@ export function RectifierConfigPanel() {
     requestThinkingBudget: true,
     requestMediaFallback: true,
     requestMediaHeuristic: true,
+    requestAzureForeignResourceStrip: true,
   });
   const [optimizerConfig, setOptimizerConfig] = useState<OptimizerConfig>({
     enabled: false,
@@ -136,6 +137,25 @@ export function RectifierConfigPanel() {
             disabled={!config.enabled || !config.requestMediaFallback}
             onCheckedChange={(checked) =>
               handleChange({ requestMediaHeuristic: checked })
+            }
+          />
+        </div>
+        <div className="flex items-center justify-between pl-4">
+          <div className="space-y-0.5">
+            <Label>
+              {t("settings.advanced.rectifier.azureForeignResourceStrip")}
+            </Label>
+            <p className="text-xs text-fg-2">
+              {t(
+                "settings.advanced.rectifier.azureForeignResourceStripDescription",
+              )}
+            </p>
+          </div>
+          <Switch
+            checked={config.requestAzureForeignResourceStrip}
+            disabled={!config.enabled}
+            onCheckedChange={(checked) =>
+              handleChange({ requestAzureForeignResourceStrip: checked })
             }
           />
         </div>

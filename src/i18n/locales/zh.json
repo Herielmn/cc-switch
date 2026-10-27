@@ -512,7 +512,9 @@
         "mediaFallback": "不支持图片降级",
         "mediaFallbackDescription": "当供应商不支持图片输入时（已声明纯文本能力，或上游返回不支持图片的错误），自动将图片块替换为 [Unsupported Image] 标记，使对话不中断",
         "mediaHeuristic": "纯文本模型预判",
-        "mediaHeuristicDescription": "发送前根据内置的已确认纯文本模型注册表剥离图片。关闭仅停用代理的注册表预判；已声明纯文本模型的处理和上游报错兜底仍保留，且不会改变 Codex 模型目录的能力声明"
+        "mediaHeuristicDescription": "发送前根据内置的已确认纯文本模型注册表剥离图片。关闭仅停用代理的注册表预判；已声明纯文本模型的处理和上游报错兜底仍保留，且不会改变 Codex 模型目录的能力声明",
+        "azureForeignResourceStrip": "Azure 跨资源条目剥离",
+        "azureForeignResourceStripDescription": "当 Azure 返回条目由其他资源创建（created under a different Azure OpenAI resource）时，去掉输入条目的 id 并对同一供应商重试一次。关闭后该错误原样返回，不剥离、不重试。"
       },
       "optimizer": {
         "title": "Bedrock 请求优化器",

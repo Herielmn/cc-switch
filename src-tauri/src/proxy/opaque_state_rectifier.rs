@@ -95,15 +95,21 @@ pub fn detect_opaque_state_rejection(
             _ => false,
         };
         if rejected {
+            // Azure 跨资源条目剥离受独立开关管辖：关闭后这类拒绝原样返回，不剥离、不重试，
+            // 也不落到下面的压缩兜底。
+            let foreign_resource = messages
+                .iter()
+                .any(|message| is_foreign_resource_rejection(message));
+            if foreign_resource && !config.request_azure_foreign_resource_strip {
+                return None;
+            }
             return Some(OpaqueStateRejection {
                 reasoning: true,
                 compaction: codex_third_party
                     || messages
                         .iter()
                         .any(|message| message.contains("compaction")),
-                item_ids: messages
-                    .iter()
-                    .any(|message| is_foreign_resource_rejection(message)),
+                item_ids: config.request_azure_foreign_resource_strip && foreign_resource,
             });
         }
     }
@@ -143,11 +149,20 @@ fn is_self_identified_rejection(
 /// 流里还没有输出就到了的失败事件，它的 `error` 对象是不是自证验不了请求里的密文。是的话返回
 /// 当作 HTTP 400 的上游错误，交给 [`detect_opaque_state_rejection`] 走和 HTTP 报错一样的整流；
 /// 不是返回 `None`，流照常交给客户端。
-pub fn in_stream_rejection(error: &Value, request: &Value) -> Option<ProxyError> {
+pub fn in_stream_rejection(
+    error: &Value,
+    request: &Value,
+    config: &RectifierConfig,
+) -> Option<ProxyError> {
     let payload = json!({ "error": error });
     let body = payload.to_string();
     let messages = error_messages(&payload);
-    is_self_identified_rejection(&body, Some(&payload), &messages, request).then(|| {
+    let rejected = is_self_identified_rejection(&body, Some(&payload), &messages, request);
+    // 与普通请求同一套开关：Azure 跨资源拒绝在开关关闭时原样交给客户端。
+    let foreign_resource = messages
+        .iter()
+        .any(|message| is_foreign_resource_rejection(message));
+    (rejected && !(foreign_resource && !config.request_azure_foreign_resource_strip)).then(|| {
         ProxyError::UpstreamError {
             status: 400,
             body: Some(body.clone()),
@@ -777,6 +792,7 @@ mod tests {
         let rejection = in_stream_rejection(
             &json!({ "code": "server_error", "message": ENCRYPTED_FUNCTION_OUTPUT_REJECTION }),
             &request,
+            &RectifierConfig::default(),
         )
         .expect("rejection");
         assert_eq!(
@@ -785,12 +801,14 @@ mod tests {
         );
         assert!(in_stream_rejection(
             &json!({ "code": "invalid_encrypted_content", "message": "x" }),
-            &request
+            &request,
+            &RectifierConfig::default(),
         )
         .is_some());
         assert!(in_stream_rejection(
             &json!({ "code": "server_error", "message": "backend exploded" }),
-            &request
+            &request,
+            &RectifierConfig::default(),
         )
         .is_none());
     }

@@ -220,6 +220,13 @@ pub struct RectifierConfig {
     /// 仍保留「显式声明」与「上游兜底」，且不改变 Codex 模型目录声明。
     #[serde(default = "default_true")]
     pub request_media_heuristic: bool,
+    /// 请求整流：Azure 跨资源条目 id 剥离（默认开启）
+    ///
+    /// Azure 按签发资源校验条目归属：中转把会话分到另一个 Azure 资源时，上游会返回
+    /// "created under a different Azure OpenAI resource"，此时去掉输入条目的 id 再重试。
+    /// 关闭后上游的这类错误原样返回，不剥离、不重试。
+    #[serde(default = "default_true")]
+    pub request_azure_foreign_resource_strip: bool,
 }
 
 fn default_true() -> bool {
@@ -238,6 +245,7 @@ impl Default for RectifierConfig {
             request_thinking_budget: true,
             request_media_fallback: true,
             request_media_heuristic: true,
+            request_azure_foreign_resource_strip: true,
         }
     }
 }
@@ -395,6 +403,10 @@ mod tests {
             config.request_media_heuristic,
             "启发式 text-only 模型识别默认应为 true"
         );
+        assert!(
+            config.request_azure_foreign_resource_strip,
+            "Azure 跨资源条目剥离默认应为 true"
+        );
     }
 
     #[test]
@@ -412,6 +424,10 @@ mod tests {
         assert!(
             config.request_media_heuristic,
             "缺 requestMediaHeuristic 时应回退默认值 true"
+        );
+        assert!(
+            config.request_azure_foreign_resource_strip,
+            "缺 requestAzureForeignResourceStrip 时应回退默认值 true"
         );
     }
 

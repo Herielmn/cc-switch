@@ -2695,11 +2695,19 @@ fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
                 completed_response = Some(data.get("response").cloned().unwrap_or(data));
             }
             "response.failed" => {
-                let message = data
-                    .pointer("/response/error/message")
-                    .and_then(|v| v.as_str())
+                let response = data.get("response").unwrap_or(&data);
+                let error = response.get("error").unwrap_or(response);
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| error.as_str())
                     .unwrap_or("response.failed event received");
-                return Err(ProxyError::TransformError(message.to_string()));
+                let error_type = error
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .or_else(|| error.get("code").and_then(Value::as_str))
+                    .unwrap_or("upstream_error");
+                return Err(ProxyError::responses_upstream_failure(error_type, message));
             }
             _ => {}
         }
