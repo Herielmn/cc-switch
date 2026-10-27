@@ -3362,7 +3362,7 @@ impl RequestForwarder {
             replay_chunks.push(chunk);
 
             while let Some(block) = sse.next_block() {
-                match opaque_state_stream_start(block, request) {
+                match opaque_state_stream_start(block, request, &self.rectifier_config) {
                     StreamStart::Pending => {}
                     StreamStart::Commit => break 'hold,
                     StreamStart::Rejected(error) => return Err(error),
@@ -4063,7 +4063,11 @@ enum StreamStart {
     Rejected(ProxyError),
 }
 
-fn opaque_state_stream_start(block: &str, request: &Value) -> StreamStart {
+fn opaque_state_stream_start(
+    block: &str,
+    request: &Value,
+    rectifier_config: &RectifierConfig,
+) -> StreamStart {
     let mut named_event = None;
     let mut data_lines = Vec::new();
     for line in block.lines() {
@@ -4086,7 +4090,11 @@ fn opaque_state_stream_start(block: &str, request: &Value) -> StreamStart {
         "response.failed" | "error" => {
             let response = value.get("response").unwrap_or(&value);
             let error = response.get("error").unwrap_or(response);
-            match super::opaque_state_rectifier::in_stream_rejection(error, request) {
+            match super::opaque_state_rectifier::in_stream_rejection(
+                error,
+                request,
+                rectifier_config,
+            ) {
                 Some(rejection) => StreamStart::Rejected(rejection),
                 None => StreamStart::Commit,
             }
@@ -4108,9 +4116,10 @@ fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError
         if let Some(rejection) = responses_envelope_opaque_rejection(trimmed.as_bytes()) {
             return Some(Err(rejection));
         }
-        return Some(Err(ProxyError::TransformError(format!(
-            "Responses upstream returned a 2xx failure: {message}"
-        ))));
+        return Some(Err(ProxyError::responses_upstream_failure(
+            "2xx_failure",
+            &message,
+        )));
     }
     Some(Ok(()))
 }
@@ -4177,9 +4186,9 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
             .or_else(|| error.get("code").and_then(Value::as_str))
             .or_else(|| response.get("status").and_then(Value::as_str))
             .unwrap_or("upstream_error");
-        return Some(Err(ProxyError::TransformError(format!(
-            "Responses upstream {error_type}: {message}"
-        ))));
+        return Some(Err(ProxyError::responses_upstream_failure(
+            error_type, message,
+        )));
     }
 
     match event {
@@ -4198,9 +4207,9 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
                 .and_then(Value::as_str)
                 .or_else(|| error.get("code").and_then(Value::as_str))
                 .unwrap_or("upstream_error");
-            Some(Err(ProxyError::TransformError(format!(
-                "Responses upstream {error_type}: {message}"
-            ))))
+            Some(Err(ProxyError::responses_upstream_failure(
+                error_type, message,
+            )))
         }
         "response.created" | "response.in_progress" | "response.queued" => None,
         "" => None,
