@@ -390,10 +390,16 @@ impl SseUsageCollector {
     }
 
     pub fn should_collect(&self, data: &str) -> bool {
-        self.inner
-            .should_collect
-            .map(|filter| filter(data))
-            .unwrap_or(true)
+        // Failure events carry no usage but must survive every protocol's usage
+        // filter so the final request row reflects the stream's actual outcome.
+        data.contains("\"error\"")
+            || data.contains("\"response.failed\"")
+            || data.contains("\"response.cancelled\"")
+            || self
+                .inner
+                .should_collect
+                .map(|filter| filter(data))
+                .unwrap_or(true)
     }
 
     /// 观察一行 SSE data，记下首个输出事件的时间（`first_token_ms`）。
@@ -454,7 +460,13 @@ fn sse_data_starts_output(event_name: Option<&str>, data: &str) -> bool {
     };
     !matches!(
         event_type.as_str(),
-        "response.created" | "response.in_progress" | "ping" | "keepalive"
+        "response.created"
+            | "response.in_progress"
+            | "ping"
+            | "keepalive"
+            | "error"
+            | "response.failed"
+            | "response.cancelled"
     )
 }
 
@@ -521,7 +533,6 @@ pub(crate) fn create_usage_collector(
     // CLAUDE_PARSER_CONFIG（app_type_str="claude"），按 parser_config 记账会把
     // claude-desktop 的行错记到 claude 名下，导致供应商计价覆盖解析不到。
     let app_type_str = ctx.app_type_str;
-    let tag = ctx.tag;
     let start_time = ctx.start_time;
     let stream_parser = parser_config.stream_parser;
     let model_extractor = parser_config.model_extractor;
@@ -531,61 +542,34 @@ pub(crate) fn create_usage_collector(
         start_time,
         parser_config.stream_event_filter,
         move |events, first_token_ms| {
-            if let Some(usage) = stream_parser(&events) {
-                let model = model_extractor(&events, &fallback_model);
-                let latency_ms = start_time.elapsed().as_millis() as u64;
+            let error = ProxyError::from_stream_events(&events);
+            let usage = stream_parser(&events).unwrap_or_default();
+            let model = model_extractor(&events, &fallback_model);
+            let latency_ms = start_time.elapsed().as_millis() as u64;
+            let state = state.clone();
+            let provider_id = provider_id.clone();
+            let session_id = session_id.clone();
+            let request_model = request_model.clone();
+            let outbound_model = fallback_model.clone();
 
-                let state = state.clone();
-                let provider_id = provider_id.clone();
-                let session_id = session_id.clone();
-                let request_model = request_model.clone();
-                let outbound_model = fallback_model.clone();
-
-                tokio::spawn(async move {
-                    log_usage_internal(
-                        &state,
-                        &provider_id,
-                        app_type_str,
-                        &model,
-                        &request_model,
-                        &outbound_model,
-                        usage,
-                        latency_ms,
-                        first_token_ms,
-                        true, // is_streaming
-                        status_code,
-                        Some(session_id),
-                    )
-                    .await;
-                });
-            } else {
-                let model = model_extractor(&events, &fallback_model);
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-                let state = state.clone();
-                let provider_id = provider_id.clone();
-                let session_id = session_id.clone();
-                let request_model = request_model.clone();
-                let outbound_model = fallback_model.clone();
-
-                tokio::spawn(async move {
-                    log_usage_internal(
-                        &state,
-                        &provider_id,
-                        app_type_str,
-                        &model,
-                        &request_model,
-                        &outbound_model,
-                        TokenUsage::default(),
-                        latency_ms,
-                        first_token_ms,
-                        true, // is_streaming
-                        status_code,
-                        Some(session_id),
-                    )
-                    .await;
-                });
-                log::debug!("[{tag}] 流式响应缺少 usage 统计，跳过消费记录");
-            }
+            tokio::spawn(async move {
+                log_usage_internal(
+                    &state,
+                    &provider_id,
+                    app_type_str,
+                    &model,
+                    &request_model,
+                    &outbound_model,
+                    usage,
+                    latency_ms,
+                    first_token_ms,
+                    true,
+                    status_code,
+                    Some(session_id),
+                    error,
+                )
+                .await;
+            });
         },
     ))
 }
@@ -634,6 +618,7 @@ fn spawn_log_usage(
             is_streaming,
             status_code,
             Some(session_id),
+            None,
         )
         .await;
     });
@@ -667,8 +652,17 @@ async fn log_usage_internal(
     is_streaming: bool,
     status_code: u16,
     session_id: Option<String>,
+    error: Option<ProxyError>,
 ) {
     use super::usage::logger::UsageLogger;
+
+    let (status_code, error_message) = match error {
+        Some(error) => (
+            super::error_mapper::map_proxy_error_to_status(&error),
+            Some(super::error_mapper::get_error_message(&error)),
+        ),
+        None => (status_code, None),
+    };
 
     let dedup_scope = super::usage::parser::dedup_scope_for_app(app_type, provider_id);
     let request_id = usage.dedup_request_id(dedup_scope);
@@ -716,6 +710,7 @@ async fn log_usage_internal(
             session_id,
             None, // provider_type
             is_streaming,
+            error_message,
         )
     });
     if let Err(e) = write.await.unwrap_or_else(|e| {
@@ -915,6 +910,48 @@ mod tests {
     use rust_decimal::Decimal;
     use std::str::FromStr;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn stream_errors_are_collected_even_without_usage() {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_in_cb = recorded.clone();
+        let collector = SseUsageCollector::new(
+            std::time::Instant::now(),
+            Some(super::super::handler_config::claude_stream_usage_event_filter),
+            move |events, first_token_ms| {
+                assert!(
+                    first_token_ms.is_none(),
+                    "an error is not productive output"
+                );
+                *recorded_in_cb.lock().unwrap() = events;
+            },
+        );
+        let input = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"unavailable service\"}}\n\n";
+        let upstream = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(input))]);
+        let stream = create_logged_passthrough_stream(
+            upstream,
+            "test",
+            Some(collector),
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+        );
+        futures::pin_mut!(stream);
+        let mut output = Vec::new();
+        while let Some(bytes) = stream.next().await {
+            output.extend_from_slice(&bytes.unwrap());
+        }
+        assert_eq!(output, input.as_bytes());
+        let events = recorded.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "an error must not be discarded by the usage filter"
+        );
+        assert_eq!(events[0]["type"], "error");
+    }
 
     #[test]
     fn sse_data_starts_output_skips_metadata_events() {
@@ -1278,6 +1315,7 @@ mod tests {
             false,
             200,
             None,
+            None,
         )
         .await;
 
@@ -1344,6 +1382,7 @@ mod tests {
             None,
             false,
             200,
+            None,
             None,
         )
         .await;
@@ -1438,6 +1477,7 @@ mod tests {
                 None,
                 false,
                 200,
+                None,
                 None,
             )
             .await;

@@ -12,8 +12,8 @@ use super::{
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::{ActiveConnectionGuard, CodexUpstreamFormat},
     handler_config::{
-        claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
-        CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
+        codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG, CODEX_PARSER_CONFIG,
+        GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
     providers::{
@@ -605,66 +605,10 @@ async fn handle_claude_transform(
             Box::new(Box::pin(create_anthropic_sse_stream(stream)))
         };
 
-        // 创建使用量收集器；关闭 usage logging 时不要再解析转换后的 SSE。
-        let usage_collector = if usage_logging_enabled(state) {
-            let state = state.clone();
-            let provider_id = ctx.provider.id.clone();
-            let request_model = ctx.request_model.clone();
-            // 上游/转换层未回显模型时，优先用映射后的出站模型兜底（路由接管真值），
-            // 其次才是客户端请求别名。空字符串视为缺失（转换器对无回显上游会合成 ""）。
-            let fallback_model = ctx
-                .outbound_model
-                .clone()
-                .unwrap_or_else(|| ctx.request_model.clone());
-            let status_code = status.as_u16();
-            let start_time = ctx.start_time;
-            let session_id = ctx.session_id.clone();
-            // 用 ctx 的 app_type：Claude Desktop 网关也走此转换路径，硬编码
-            // "claude" 会把 claude-desktop 的行错记到 claude 名下
-            let app_type_str = ctx.app_type_str;
-
-            Some(SseUsageCollector::new(
-                start_time,
-                Some(claude_stream_usage_event_filter),
-                move |events, first_token_ms| {
-                    if let Some(usage) = TokenUsage::from_claude_stream_events(&events) {
-                        let model = usage
-                            .model
-                            .clone()
-                            .filter(|m| !m.is_empty())
-                            .unwrap_or_else(|| fallback_model.clone());
-                        let latency_ms = start_time.elapsed().as_millis() as u64;
-                        let state = state.clone();
-                        let provider_id = provider_id.clone();
-                        let session_id = session_id.clone();
-                        let request_model = request_model.clone();
-                        let outbound_model = fallback_model.clone();
-
-                        tokio::spawn(async move {
-                            log_usage(
-                                &state,
-                                &provider_id,
-                                app_type_str,
-                                &model,
-                                &request_model,
-                                &outbound_model,
-                                usage,
-                                latency_ms,
-                                first_token_ms,
-                                true,
-                                status_code,
-                                Some(session_id),
-                            )
-                            .await;
-                        });
-                    } else {
-                        log::debug!("[Claude] OpenRouter 流式响应缺少 usage 统计，跳过消费记录");
-                    }
-                },
-            ))
-        } else {
-            None
-        };
+        // The shared collector records semantic failures even when no billable
+        // usage was returned, and keeps partial usage on failed streams.
+        let usage_collector =
+            create_usage_collector(ctx, state, status.as_u16(), &CLAUDE_PARSER_CONFIG);
 
         // 获取流式超时配置
         let timeout_config = ctx.streaming_timeout_config();
@@ -3308,6 +3252,7 @@ async fn log_usage(
             session_id,
             None, // provider_type
             is_streaming,
+            None,
         )
     });
     if let Err(e) = write.await.unwrap_or_else(|e| {
@@ -4016,8 +3961,11 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstr
 
         let err = responses_sse_to_response_value(sse).unwrap_err();
         match err {
-            ProxyError::TransformError(msg) => assert!(msg.contains("upstream blew up")),
-            other => panic!("expected TransformError, got {other:?}"),
+            ProxyError::UpstreamError {
+                status: 502,
+                body: Some(msg),
+            } => assert!(msg.contains("upstream blew up")),
+            other => panic!("expected retryable UpstreamError 502, got {other:?}"),
         }
     }
 
@@ -4123,6 +4071,100 @@ mod stack_tests {
         let status = response.status();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn responses_stream_failure_is_logged_once_with_or_without_usage() {
+        use http_body_util::BodyExt;
+        for has_usage in [false, true] {
+            let state = proxy_state();
+            let body = json!({"model": "req-model", "messages": [], "stream": true});
+            let provider = crate::provider::Provider::with_id(
+                "responses-test".into(),
+                "Responses test".into(),
+                json!({}),
+                None,
+            );
+            let mut ctx = RequestContext::new(
+                &state,
+                &body,
+                &axum::http::HeaderMap::new(),
+                AppType::Claude,
+                "Claude",
+                "claude",
+                Some(crate::mode::stack::StackTarget {
+                    provider,
+                    upstream_model: "resp-model".into(),
+                    original_model: "req-model".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            ctx.outbound_model = Some("resp-model".into());
+            let mut failed = json!({"type": "response.failed", "response": {
+                "status": "failed", "error": {
+                    "type": "new_api_error", "message": "unavailable service [hub-request-id=test-hub]"
+                }
+            }});
+            if has_usage {
+                failed["response"]["usage"] = json!({"input_tokens": 10, "output_tokens": 3});
+            }
+            let sse = format!(
+                "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-test\",\"model\":\"resp-model\"}}}}\n\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}}\n\nevent: response.failed\ndata: {failed}\n\n"
+            );
+            let upstream = super::super::hyper_client::ProxyResponse::streamed(
+                StatusCode::OK,
+                axum::http::HeaderMap::new(),
+                futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(sse))]),
+            );
+            let response = handle_claude_transform(
+                upstream,
+                &ctx,
+                &state,
+                &body,
+                true,
+                "openai_responses",
+                None,
+            )
+            .await
+            .unwrap();
+            let output = response.into_body().collect().await.unwrap().to_bytes();
+            let output = String::from_utf8(output.to_vec()).unwrap();
+            assert!(output.contains("overloaded_error"), "{output}");
+            assert!(output.contains("test-hub"));
+            assert!(!output.contains("event: message_stop"));
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let count: i64 = {
+                        let conn = state.db.conn.lock().unwrap();
+                        conn.query_row("SELECT COUNT(*) FROM proxy_request_logs", [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap()
+                    };
+                    if count > 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("stream completion should persist its outcome");
+            let conn = state.db.conn.lock().unwrap();
+            let (count, status, message, input, output, session): (i64, u16, String, u32, u32, String) = conn.query_row(
+                "SELECT COUNT(*), status_code, error_message, input_tokens, output_tokens, session_id FROM proxy_request_logs",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            ).unwrap();
+            assert_eq!(
+                count, 1,
+                "do not write a separate success/usage row for a failed stream"
+            );
+            assert_eq!(status, 503);
+            assert!(message.contains("test-hub"));
+            assert_eq!((input, output), if has_usage { (10, 3) } else { (0, 0) });
+            assert_eq!(session, ctx.session_id);
+        }
     }
 
     #[tokio::test]

@@ -2952,10 +2952,8 @@ impl RequestForwarder {
             None => raw.to_vec(),
         };
 
-        if let Some(message) = responses_error_envelope_message(&decoded) {
-            return Err(ProxyError::TransformError(format!(
-                "Responses upstream returned a 2xx failure: {message}"
-            )));
+        if let Some(error) = responses_error_envelope(&decoded) {
+            return Err(error);
         }
 
         Ok(ProxyResponse::buffered(status, headers, raw))
@@ -3650,30 +3648,9 @@ fn codex_anthropic_error_envelope_message(body: &[u8]) -> Option<String> {
     Some(format!("{error_type}: {message}"))
 }
 
-fn responses_error_envelope_message(body: &[u8]) -> Option<String> {
+fn responses_error_envelope(body: &[u8]) -> Option<ProxyError> {
     let value: Value = serde_json::from_slice(body).ok()?;
-    let status = value.get("status").and_then(Value::as_str);
-    let has_error = value.get("error").is_some_and(|error| !error.is_null());
-    if !matches!(status, Some("failed" | "cancelled")) && !has_error {
-        return None;
-    }
-
-    let error = value.get("error").unwrap_or(&value);
-    let error_type = error
-        .get("type")
-        .and_then(Value::as_str)
-        .or_else(|| error.get("code").and_then(Value::as_str))
-        .unwrap_or_else(|| status.unwrap_or("error"));
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .or_else(|| error.as_str())
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or(match status {
-            Some("cancelled") => "response generation was cancelled",
-            _ => "response generation failed",
-        });
-    Some(format!("{error_type}: {message}"))
+    ProxyError::from_responses_failure(&value)
 }
 
 /// Prompt caching is part of the Codex→Anthropic protocol bridge rather than an
@@ -3747,12 +3724,9 @@ fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError
     if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
         return None;
     }
-    let _: Value = serde_json::from_str(trimmed).ok()?;
-    if let Some(message) = responses_error_envelope_message(trimmed.as_bytes()) {
-        return Some(Err(ProxyError::responses_upstream_failure(
-            "2xx_failure",
-            &message,
-        )));
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    if let Some(error) = ProxyError::from_responses_failure(&value) {
+        return Some(Err(error));
     }
     Some(Ok(()))
 }
@@ -3784,26 +3758,8 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
         .unwrap_or("");
 
     let response = value.get("response").unwrap_or(&value);
-    if matches!(
-        response.get("status").and_then(Value::as_str),
-        Some("failed" | "cancelled")
-    ) || response.get("error").is_some_and(|error| !error.is_null())
-    {
-        let error = response.get("error").unwrap_or(response);
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .or_else(|| error.as_str())
-            .unwrap_or("Responses upstream failed before output");
-        let error_type = error
-            .get("type")
-            .and_then(Value::as_str)
-            .or_else(|| error.get("code").and_then(Value::as_str))
-            .or_else(|| response.get("status").and_then(Value::as_str))
-            .unwrap_or("upstream_error");
-        return Some(Err(ProxyError::responses_upstream_failure(
-            error_type, message,
-        )));
+    if let Some(error) = ProxyError::from_responses_failure(&value) {
+        return Some(Err(error));
     }
 
     match event {
@@ -5476,25 +5432,23 @@ mod tests {
 
     #[test]
     fn responses_2xx_failure_is_detected_for_failover() {
-        assert_eq!(
-            responses_error_envelope_message(
-                br#"{"status":"failed","error":{"type":"server_error","message":"busy"},"output":[]}"#
-            )
-            .as_deref(),
-            Some("server_error: busy")
-        );
-        assert_eq!(
-            responses_error_envelope_message(br#"{"status":"cancelled","output":[]}"#).as_deref(),
-            Some("cancelled: response generation was cancelled")
-        );
-        assert!(responses_error_envelope_message(
+        for (body, status, message) in [
+            (br#"{"status":"failed","error":{"type":"server_error","message":"busy"},"output":[]}"#.as_slice(), 502, "busy"),
+            (br#"{"status":"cancelled","output":[]}"#.as_slice(), 502, "cancelled"),
+            (br#"{"error":{"type":"new_api_error","message":"unavailable service"}}"#.as_slice(), 503, "unavailable service"),
+            (br#"{"error":{"type":"invalid_request_error","message":"bad schema"}}"#.as_slice(), 400, "bad schema"),
+        ] {
+            let error = responses_error_envelope(body).expect("upstream failure detected");
+            assert_eq!(super::super::error_mapper::map_proxy_error_to_status(&error), status);
+            assert!(super::super::error_mapper::get_error_message(&error).contains(message));
+        }
+        assert!(responses_error_envelope(
             br#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}"#
-        )
-        .is_none());
-        assert!(responses_error_envelope_message(
-            br#"{"status":"completed","error":null,"output":[]}"#
-        )
-        .is_none());
+        ).is_none());
+        assert!(
+            responses_error_envelope(br#"{"status":"completed","error":null,"output":[]}"#)
+                .is_none()
+        );
     }
 
     #[test]
@@ -5511,7 +5465,7 @@ mod tests {
         );
         assert!(matches!(
             inspect_responses_start_event(failed),
-            Some(Err(ProxyError::TransformError(message))) if message.contains("boom")
+            Some(Err(ProxyError::UpstreamError { status: 502, body: Some(message) })) if message.contains("boom")
         ));
 
         let delta = concat!(
@@ -5539,7 +5493,7 @@ mod tests {
             r#"{"status":"failed","error":{"message":"backend unavailable"}}"#,
         );
         assert!(
-            matches!(failed, Some(Err(ProxyError::TransformError(message))) if message.contains("backend unavailable"))
+            matches!(failed, Some(Err(ProxyError::UpstreamError { status: 502, body: Some(message) })) if message.contains("backend unavailable"))
         );
     }
 
