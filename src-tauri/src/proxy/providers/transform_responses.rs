@@ -2147,52 +2147,10 @@ pub(crate) fn map_responses_stop_reason(
     })
 }
 
-fn responses_error_message(body: &Value, fallback: &str) -> String {
-    body.pointer("/error/message")
-        .and_then(Value::as_str)
-        .or_else(|| body.get("message").and_then(Value::as_str))
-        .or_else(|| body.get("error").and_then(Value::as_str))
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or(fallback)
-        .to_string()
-}
-
-/// Extract the upstream error type from a Responses failure envelope.
-///
-/// The type can live under `error.type`, `error.code`, or (for terminal
-/// statuses without an error object) the response status itself.
-fn responses_error_signal<'a>(body: &'a Value, fallback: &'a str) -> &'a str {
-    body.pointer("/error/type")
-        .and_then(Value::as_str)
-        .or_else(|| body.pointer("/error/code").and_then(Value::as_str))
-        .or_else(|| body.get("status").and_then(Value::as_str))
-        .unwrap_or(fallback)
-}
-
 fn validate_responses_terminal_status(body: &Value) -> Result<(), ProxyError> {
-    let status = body.get("status").and_then(Value::as_str);
-    let has_error = body.get("error").is_some_and(|error| !error.is_null());
-
-    match status {
-        Some("failed") => {
-            let message = responses_error_message(body, "response generation failed");
-            Err(ProxyError::responses_upstream_failure(
-                responses_error_signal(body, "failed"),
-                &message,
-            ))
-        }
-        Some("cancelled") => Err(ProxyError::TransformError(format!(
-            "Responses upstream cancelled the response: {}",
-            responses_error_message(body, "response generation was cancelled")
-        ))),
-        _ if has_error => {
-            let message = responses_error_message(body, "unknown upstream error");
-            Err(ProxyError::responses_upstream_failure(
-                responses_error_signal(body, "upstream_error"),
-                &message,
-            ))
-        }
-        _ => Ok(()),
+    match ProxyError::from_responses_failure(body) {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -4963,7 +4921,7 @@ mod tests {
 
         let error = responses_to_anthropic_with_web_search_options(input, None, None).unwrap_err();
         assert!(
-            matches!(error, ProxyError::TransformError(message) if message.contains("backend exploded"))
+            matches!(error, ProxyError::UpstreamError { status: 502, body: Some(message) } if message.contains("backend exploded"))
         );
     }
 
@@ -4994,7 +4952,7 @@ mod tests {
 
         let error = responses_to_anthropic_with_web_search_options(input, None, None).unwrap_err();
         assert!(
-            matches!(error, ProxyError::TransformError(message) if message.contains("cancelled"))
+            matches!(error, ProxyError::UpstreamError { status: 502, body: Some(message) } if message.contains("cancelled"))
         );
     }
 

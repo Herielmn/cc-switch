@@ -18,14 +18,63 @@ pub fn is_rate_limit_error(text: &str) -> bool {
         || lower.contains("rate limit")
 }
 
-/// Map a transform/conversion error message to the HTTP status the client
-/// must see. Rate limits are 429 so Claude Code and other clients retry
-/// instead of treating the payload as a permanent format failure.
+/// Relay overload signals, including the bilingual message returned by AGY.
+pub fn is_upstream_unavailable_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("unavailable service")
+        || lower.contains("service unavailable")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("service_unavailable")
+        || lower.contains("upstream_unavailable")
+        || lower.contains("overloaded")
+        || lower.contains("上游服务暂时不可用")
+        || lower.contains("上游服务暂不可用")
+}
+
+/// Reserve 422 for actual conversion failures, not upstream overloads.
 pub fn transform_error_status(message: &str) -> StatusCode {
     if is_rate_limit_error(message) {
         StatusCode::TOO_MANY_REQUESTS
+    } else if is_upstream_unavailable_error(message) {
+        StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::UNPROCESSABLE_ENTITY
+    }
+}
+
+/// Error types understood by Anthropic-compatible clients' retry handling.
+pub(crate) fn anthropic_error_type(status: u16) -> &'static str {
+    match status {
+        400 | 422 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        503 | 529 => "overloaded_error",
+        _ => "api_error",
+    }
+}
+
+fn responses_failure_status(error_type: &str, code: Option<&str>, message: &str) -> u16 {
+    let signal = format!("{error_type} {} {message}", code.unwrap_or(""));
+    let kind = format!("{error_type} {}", code.unwrap_or("")).to_ascii_lowercase();
+    if is_rate_limit_error(&signal) {
+        429
+    } else if kind.contains("invalid_request") || kind.contains("context_length_exceeded") {
+        400
+    } else if kind.contains("authentication") || kind.contains("invalid_api_key") {
+        401
+    } else if kind.contains("permission") || kind.contains("access_denied") {
+        403
+    } else if kind.contains("not_found") {
+        404
+    } else if is_upstream_unavailable_error(&signal) {
+        503
+    } else if kind.contains("timeout") || kind.contains("timed_out") {
+        504
+    } else {
+        // A failed upstream generation is not a local schema/conversion failure.
+        502
     }
 }
 
@@ -197,29 +246,64 @@ impl IntoResponse for ProxyError {
 }
 
 impl ProxyError {
-    /// Build the client-facing error for a Responses upstream failure envelope.
-    /// Rate-limit envelopes become `UpstreamError { status: 429 }`; anything
-    /// else stays a transform error (real conversion bugs are still 422).
+    /// Keep upstream failures in the HTTP retry domain. Only genuine local
+    /// conversion failures should be represented by `TransformError` / 422.
     pub fn responses_upstream_failure(error_type: &str, message: &str) -> Self {
-        let signal = format!("{error_type} {message}");
-        if is_rate_limit_error(&signal) {
-            ProxyError::UpstreamError {
-                status: 429,
-                body: Some(
-                    json!({
-                        "error": {
-                            "type": "rate_limit_error",
-                            "code": "too_many_requests",
-                            "message": message,
-                            "upstream_type": error_type,
-                        }
-                    })
-                    .to_string(),
-                ),
-            }
-        } else {
-            ProxyError::TransformError(format!("Responses upstream {error_type}: {message}"))
+        Self::responses_failure_with_code(error_type, None, message)
+    }
+
+    fn responses_failure_with_code(error_type: &str, code: Option<&str>, message: &str) -> Self {
+        let status = responses_failure_status(error_type, code, message);
+        let mut error = json!({
+            "type": anthropic_error_type(status),
+            "message": message,
+            "upstream_type": error_type,
+        });
+        if let Some(code) = code.or((status == 429).then_some("too_many_requests")) {
+            error["code"] = json!(code);
         }
+        Self::UpstreamError {
+            status,
+            body: Some(json!({"error": error}).to_string()),
+        }
+    }
+
+    /// Accept both whole Responses failure objects and raw/converted SSE errors.
+    /// Normal lifecycle events with `error:null` are not failures.
+    pub(crate) fn from_responses_failure(value: &serde_json::Value) -> Option<Self> {
+        let response = value.get("response").unwrap_or(value);
+        let status = response.get("status").and_then(serde_json::Value::as_str);
+        let error = response.get("error").filter(|error| !error.is_null());
+        let event_type = value.get("type").and_then(serde_json::Value::as_str);
+        if error.is_none()
+            && !matches!(status, Some("failed" | "cancelled"))
+            && !matches!(event_type, Some("error" | "response.failed"))
+        {
+            return None;
+        }
+        let error = error.unwrap_or(response);
+        let error_type = error
+            .get("upstream_type")
+            .or_else(|| error.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| error.get("code").and_then(serde_json::Value::as_str))
+            .unwrap_or(status.unwrap_or("upstream_error"));
+        let code = error.get("code").and_then(serde_json::Value::as_str);
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| error.as_str())
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or(if status == Some("cancelled") {
+                "response generation was cancelled"
+            } else {
+                "response generation failed"
+            });
+        Some(Self::responses_failure_with_code(error_type, code, message))
+    }
+
+    pub(crate) fn from_stream_events(events: &[serde_json::Value]) -> Option<Self> {
+        events.iter().find_map(Self::from_responses_failure)
     }
 }
 
@@ -272,6 +356,55 @@ mod tests {
     impl std::error::Error for Outer {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn responses_unavailable_is_retryable_not_a_transform_error() {
+        let message = "上游服务暂时不可用，unavailable service [hub-request-id=test-hub]";
+        let error = ProxyError::responses_upstream_failure("new_api_error", message);
+        assert_eq!(
+            super::super::error_mapper::map_proxy_error_to_status(&error),
+            503
+        );
+        match error {
+            ProxyError::UpstreamError {
+                body: Some(body), ..
+            } => {
+                let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body["error"]["type"], "overloaded_error");
+                assert_eq!(body["error"]["upstream_type"], "new_api_error");
+                assert_eq!(body["error"]["message"], message);
+            }
+            other => panic!("expected an upstream failure, got {other:?}"),
+        }
+        assert_eq!(
+            transform_error_status(message),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            transform_error_status("bad response conversion"),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn responses_failure_status_preserves_retry_and_request_error_semantics() {
+        for (error_type, message, expected) in [
+            ("rate_limit_error", "too many requests", 429),
+            ("server_error", "backend exploded", 502),
+            ("new_api_error", "service_unavailable", 503),
+            ("new_api_error", "unknown upstream failure", 502),
+            ("invalid_request_error", "invalid tool schema", 400),
+            ("authentication_error", "invalid API key", 401),
+            ("permission_error", "access denied", 403),
+        ] {
+            let error = ProxyError::responses_upstream_failure(error_type, message);
+            assert_eq!(
+                super::super::error_mapper::map_proxy_error_to_status(&error),
+                expected,
+                "{error_type}"
+            );
         }
     }
 

@@ -3224,13 +3224,11 @@ impl RequestForwarder {
             None => raw.to_vec(),
         };
 
-        if let Some(message) = responses_error_envelope_message(&decoded) {
-            if let Some(rejection) = responses_envelope_opaque_rejection(&decoded) {
+        if let Some(error) = responses_error_envelope(&decoded) {
+            if let Some(rejection) = responses_envelope_opaque_rejection(&decoded, &self.rectifier_config) {
                 return Err(rejection);
             }
-            return Err(ProxyError::TransformError(format!(
-                "Responses upstream returned a 2xx failure: {message}"
-            )));
+            return Err(error);
         }
 
         Ok(ProxyResponse::buffered(status, headers, raw))
@@ -3263,13 +3261,13 @@ impl RequestForwarder {
             };
 
             let Some(chunk) = next else {
-                if let Some(outcome) = inspect_responses_json_document(sse.pending()) {
+                if let Some(outcome) = inspect_responses_json_document(sse.pending(), &self.rectifier_config) {
                     outcome?;
                     let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                     return Ok(ProxyResponse::streamed(status, headers, replay));
                 }
                 if !sse.pending().trim().is_empty() {
-                    if let Some(outcome) = inspect_responses_start_event(sse.pending().trim()) {
+                    if let Some(outcome) = inspect_responses_start_event(sse.pending().trim(), &self.rectifier_config) {
                         outcome?;
                         let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                         return Ok(ProxyResponse::streamed(status, headers, replay));
@@ -3292,14 +3290,14 @@ impl RequestForwarder {
             // Responses JSON document without a JSON content-type. Recognize that
             // shape before looking for SSE delimiters; pretty-printed JSON may itself
             // contain blank lines and must stay intact.
-            if let Some(outcome) = inspect_responses_json_document(sse.pending()) {
+            if let Some(outcome) = inspect_responses_json_document(sse.pending(), &self.rectifier_config) {
                 outcome?;
                 let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
                 return Ok(ProxyResponse::streamed(status, headers, replay));
             }
 
             while let Some(block) = sse.next_block() {
-                if let Some(outcome) = inspect_responses_start_event(block) {
+                if let Some(outcome) = inspect_responses_start_event(block, &self.rectifier_config) {
                     outcome?;
                     let replay =
                         futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
@@ -4014,30 +4012,9 @@ fn codex_anthropic_error_envelope_message(body: &[u8]) -> Option<String> {
     Some(format!("{error_type}: {message}"))
 }
 
-fn responses_error_envelope_message(body: &[u8]) -> Option<String> {
+fn responses_error_envelope(body: &[u8]) -> Option<ProxyError> {
     let value: Value = serde_json::from_slice(body).ok()?;
-    let status = value.get("status").and_then(Value::as_str);
-    let has_error = value.get("error").is_some_and(|error| !error.is_null());
-    if !matches!(status, Some("failed" | "cancelled")) && !has_error {
-        return None;
-    }
-
-    let error = value.get("error").unwrap_or(&value);
-    let error_type = error
-        .get("type")
-        .and_then(Value::as_str)
-        .or_else(|| error.get("code").and_then(Value::as_str))
-        .unwrap_or_else(|| status.unwrap_or("error"));
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .or_else(|| error.as_str())
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or(match status {
-            Some("cancelled") => "response generation was cancelled",
-            _ => "response generation failed",
-        });
-    Some(format!("{error_type}: {message}"))
+    ProxyError::from_responses_failure(&value)
 }
 
 /// Prompt caching is part of the Codex→Anthropic protocol bridge rather than an
@@ -4106,20 +4083,17 @@ fn opaque_state_stream_start(
 /// A streaming request may receive a whole JSON document even when the gateway
 /// omits `application/json`. `None` means either "not JSON" or "not complete yet";
 /// a parsed document is safe to commit unless it is a semantic failure envelope.
-fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError>> {
+fn inspect_responses_json_document(buffer: &str, rectifier_config: &RectifierConfig) -> Option<Result<(), ProxyError>> {
     let trimmed = buffer.trim();
     if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
         return None;
     }
-    let _: Value = serde_json::from_str(trimmed).ok()?;
-    if let Some(message) = responses_error_envelope_message(trimmed.as_bytes()) {
-        if let Some(rejection) = responses_envelope_opaque_rejection(trimmed.as_bytes()) {
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    if let Some(error) = ProxyError::from_responses_failure(&value) {
+        if let Some(rejection) = responses_envelope_opaque_rejection(trimmed.as_bytes(), rectifier_config) {
             return Some(Err(rejection));
         }
-        return Some(Err(ProxyError::responses_upstream_failure(
-            "2xx_failure",
-            &message,
-        )));
+        return Some(Err(error));
     }
     Some(Ok(()))
 }
@@ -4127,22 +4101,22 @@ fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError
 /// 有些网关先回 HTTP 200，再在输出前（或 2xx 的 Response 对象里）说验不了请求里的密文
 /// （#9424）。这种失败改成上游 400，回到重试循环和 HTTP 报错一样做密文整流；
 /// 其余失败照旧当转换错误，可以换下一家。
-fn opaque_rejection_before_output(error: &Value) -> Option<ProxyError> {
-    super::opaque_state_rectifier::in_stream_rejection(error, &Value::Null)
+fn opaque_rejection_before_output(error: &Value, rectifier_config: &RectifierConfig) -> Option<ProxyError> {
+    super::opaque_state_rectifier::in_stream_rejection(error, &Value::Null, rectifier_config)
 }
 
-fn responses_envelope_opaque_rejection(body: &[u8]) -> Option<ProxyError> {
+fn responses_envelope_opaque_rejection(body: &[u8], rectifier_config: &RectifierConfig) -> Option<ProxyError> {
     let value: Value = serde_json::from_slice(body).ok()?;
     value
         .get("error")
         .filter(|error| !error.is_null())
-        .and_then(opaque_rejection_before_output)
+        .and_then(|error| opaque_rejection_before_output(error, rectifier_config))
 }
 
 /// Inspect one complete Responses SSE block while the response is still inside
 /// the retry loop. `None` means the event is lifecycle-only and priming should
 /// continue; `Some(Ok(()))` means it is safe to commit/replay the stream.
-fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> {
+fn inspect_responses_start_event(block: &str, rectifier_config: &RectifierConfig) -> Option<Result<(), ProxyError>> {
     let mut named_event = None;
     let mut data_lines = Vec::new();
     for line in block.lines() {
@@ -4166,35 +4140,18 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
         .unwrap_or("");
 
     let response = value.get("response").unwrap_or(&value);
-    if matches!(
-        response.get("status").and_then(Value::as_str),
-        Some("failed" | "cancelled")
-    ) || response.get("error").is_some_and(|error| !error.is_null())
-    {
-        let error = response.get("error").unwrap_or(response);
-        if let Some(rejection) = opaque_rejection_before_output(error) {
+    if let Some(error) = ProxyError::from_responses_failure(&value) {
+        let upstream_error = response.get("error").unwrap_or(response);
+        if let Some(rejection) = opaque_rejection_before_output(upstream_error, rectifier_config) {
             return Some(Err(rejection));
         }
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .or_else(|| error.as_str())
-            .unwrap_or("Responses upstream failed before output");
-        let error_type = error
-            .get("type")
-            .and_then(Value::as_str)
-            .or_else(|| error.get("code").and_then(Value::as_str))
-            .or_else(|| response.get("status").and_then(Value::as_str))
-            .unwrap_or("upstream_error");
-        return Some(Err(ProxyError::responses_upstream_failure(
-            error_type, message,
-        )));
+        return Some(Err(error));
     }
 
     match event {
         "response.failed" | "error" => {
             let error = response.get("error").unwrap_or(response);
-            if let Some(rejection) = opaque_rejection_before_output(error) {
+            if let Some(rejection) = opaque_rejection_before_output(error, rectifier_config) {
                 return Some(Err(rejection));
             }
             let message = error
@@ -5955,25 +5912,23 @@ mod tests {
 
     #[test]
     fn responses_2xx_failure_is_detected_for_failover() {
-        assert_eq!(
-            responses_error_envelope_message(
-                br#"{"status":"failed","error":{"type":"server_error","message":"busy"},"output":[]}"#
-            )
-            .as_deref(),
-            Some("server_error: busy")
-        );
-        assert_eq!(
-            responses_error_envelope_message(br#"{"status":"cancelled","output":[]}"#).as_deref(),
-            Some("cancelled: response generation was cancelled")
-        );
-        assert!(responses_error_envelope_message(
+        for (body, status, message) in [
+            (br#"{"status":"failed","error":{"type":"server_error","message":"busy"},"output":[]}"#.as_slice(), 502, "busy"),
+            (br#"{"status":"cancelled","output":[]}"#.as_slice(), 502, "cancelled"),
+            (br#"{"error":{"type":"new_api_error","message":"unavailable service"}}"#.as_slice(), 503, "unavailable service"),
+            (br#"{"error":{"type":"invalid_request_error","message":"bad schema"}}"#.as_slice(), 400, "bad schema"),
+        ] {
+            let error = responses_error_envelope(body).expect("upstream failure detected");
+            assert_eq!(super::super::error_mapper::map_proxy_error_to_status(&error), status);
+            assert!(super::super::error_mapper::get_error_message(&error).contains(message));
+        }
+        assert!(responses_error_envelope(
             br#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}"#
-        )
-        .is_none());
-        assert!(responses_error_envelope_message(
-            br#"{"status":"completed","error":null,"output":[]}"#
-        )
-        .is_none());
+        ).is_none());
+        assert!(
+            responses_error_envelope(br#"{"status":"completed","error":null,"output":[]}"#)
+                .is_none()
+        );
     }
 
     #[test]
@@ -5990,7 +5945,7 @@ mod tests {
         );
         assert!(matches!(
             inspect_responses_start_event(failed),
-            Some(Err(ProxyError::TransformError(message))) if message.contains("boom")
+            Some(Err(ProxyError::UpstreamError { status: 502, body: Some(message) })) if message.contains("boom")
         ));
 
         let delta = concat!(
@@ -6051,7 +6006,7 @@ mod tests {
             r#"{"status":"failed","error":{"message":"backend unavailable"}}"#,
         );
         assert!(
-            matches!(failed, Some(Err(ProxyError::TransformError(message))) if message.contains("backend unavailable"))
+            matches!(failed, Some(Err(ProxyError::UpstreamError { status: 502, body: Some(message) })) if message.contains("backend unavailable"))
         );
     }
 

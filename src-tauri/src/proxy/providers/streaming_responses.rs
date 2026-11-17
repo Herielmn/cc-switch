@@ -34,33 +34,50 @@ fn anthropic_sse(event_name: &str, payload: &Value) -> Bytes {
     ))
 }
 
-fn responses_error_details(data: &Value, fallback: &str) -> (String, String) {
-    let response = response_object_from_event(data);
-    let error = response.get("error").unwrap_or(response);
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .or_else(|| error.as_str())
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or(fallback)
-        .to_string();
-    let error_type = error
-        .get("type")
-        .and_then(Value::as_str)
-        .or_else(|| error.get("code").and_then(Value::as_str))
-        .unwrap_or("upstream_error")
-        .to_string();
-    (message, error_type)
+fn anthropic_error_sse(message: &str, error_type: &str) -> Bytes {
+    normalized_error_sse(
+        crate::proxy::ProxyError::responses_upstream_failure(error_type, message),
+        None,
+    )
 }
 
-fn anthropic_error_sse(message: &str, error_type: &str) -> Bytes {
-    anthropic_sse(
-        "error",
-        &json!({
-            "type": "error",
-            "error": {"type": error_type, "message": message}
-        }),
-    )
+fn anthropic_upstream_error_sse(data: &Value, fallback: &str) -> Bytes {
+    let error = crate::proxy::ProxyError::from_responses_failure(data).unwrap_or_else(|| {
+        crate::proxy::ProxyError::responses_upstream_failure("upstream_error", fallback)
+    });
+    normalized_error_sse(error, response_object_from_event(data).get("usage"))
+}
+
+fn normalized_error_sse(error: crate::proxy::ProxyError, usage: Option<&Value>) -> Bytes {
+    let status = crate::proxy::error_mapper::map_proxy_error_to_status(&error);
+    let message = crate::proxy::error_mapper::get_error_message(&error);
+    // Log only the bounded error, never the response/output chunks. This also
+    // runs when usage logging is disabled or the upstream supplied no usage.
+    log::warn!(
+        "[Claude/Responses] 流错误: status={status}, {}",
+        message.chars().take(2048).collect::<String>()
+    );
+    let error_body = match &error {
+        crate::proxy::ProxyError::UpstreamError {
+            body: Some(body), ..
+        } => serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|body| body.get("error").cloned()),
+        _ => None,
+    }
+    .unwrap_or_else(|| {
+        json!({
+            "type": crate::proxy::error::anthropic_error_type(status),
+            "message": error.to_string(),
+        })
+    });
+    let mut payload = json!({"type": "error", "error": error_body});
+    if let Some(usage) = usage {
+        // Keep the failed terminal's actual usage without emitting a successful
+        // message_stop. Clients ignore this metadata; the collector retains it.
+        payload["usage"] = build_anthropic_usage_from_responses(Some(usage));
+    }
+    anthropic_sse("error", &payload)
 }
 
 fn anthropic_ping_sse() -> Bytes {
@@ -113,6 +130,9 @@ fn responses_json_to_anthropic_sse(
     hosted_web_search_name: Option<&str>,
     max_web_search_uses: Option<u64>,
 ) -> Vec<Bytes> {
+    if let Some(error) = crate::proxy::ProxyError::from_responses_failure(&body) {
+        return vec![normalized_error_sse(error, body.get("usage"))];
+    }
     // Zero-usage incomplete terminals are request rejections, not truncation;
     // decide before `body` is consumed by the conversion below.
     let unprocessed_rejection =
@@ -123,12 +143,7 @@ fn responses_json_to_anthropic_sse(
         max_web_search_uses,
     ) {
         Ok(message) => message,
-        Err(error) => {
-            return vec![anthropic_error_sse(
-                &error.to_string(),
-                "response_transform_error",
-            )]
-        }
+        Err(error) => return vec![normalized_error_sse(error, None)],
     };
 
     let usage = message.get("usage").cloned().unwrap_or_else(|| json!({}));
@@ -3538,11 +3553,10 @@ fn create_anthropic_sse_stream_from_responses_raw<E: std::error::Error + Send + 
                                     .get("error")
                                     .is_some_and(|error| !error.is_null())
                                 {
-                                    let (message, error_type) = responses_error_details(
+                                    yield Ok(anthropic_upstream_error_sse(
                                         &data,
                                         "Responses upstream returned a failed terminal response",
-                                    );
-                                    yield Ok(anthropic_error_sse(&message, &error_type));
+                                    ));
                                     terminated = true;
                                     continue;
                                 }
@@ -4064,15 +4078,14 @@ fn create_anthropic_sse_stream_from_responses_raw<E: std::error::Error + Send + 
                             // Preserve the upstream details instead of silently ending.
                             // ================================================
                             "response.failed" | "error" => {
-                                let (message, error_type) = responses_error_details(
+                                yield Ok(anthropic_upstream_error_sse(
                                     &data,
                                     if event_name == "response.failed" {
                                         "Responses upstream reported response.failed"
                                     } else {
                                         "Responses upstream emitted an error event"
                                     },
-                                );
-                                yield Ok(anthropic_error_sse(&message, &error_type));
+                                ));
                                 terminated = true;
                             }
 
@@ -4597,17 +4610,7 @@ fn create_anthropic_sse_stream_from_responses_raw<E: std::error::Error + Send + 
                     if terminated {
                         break;
                     }
-                    log::error!("Responses stream error: {e}");
-                    let error_event = json!({
-                        "type": "error",
-                        "error": {
-                            "type": "stream_error",
-                            "message": format!("Stream error: {e}")
-                        }
-                    });
-                    let sse = format!("event: error\ndata: {}\n\n",
-                        serde_json::to_string(&error_event).unwrap_or_default());
-                    yield Ok(Bytes::from(sse));
+                    yield Ok(anthropic_error_sse(&format!("Stream error: {e}"), "stream_error"));
                     terminated = true;
                     break;
                 }
@@ -5707,6 +5710,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unavailable_service_stream_error_uses_retryable_anthropic_type() {
+        for event in ["error", "response.failed"] {
+            let response = json!({"error": {
+                "type": "new_api_error",
+                "message": "上游服务暂时不可用，unavailable service [hub-request-id=test-hub]"
+            }});
+            let data = if event == "error" {
+                json!({"type": event, "error": response["error"]})
+            } else {
+                json!({"type": event, "response": response})
+            };
+            let input = format!("event: {event}\ndata: {data}\n\n");
+            let merged = convert_stream_text(input).await;
+            let data = merged
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            let error: Value = serde_json::from_str(data).unwrap();
+            assert_eq!(error["error"]["type"], "overloaded_error");
+            assert_eq!(error["error"]["upstream_type"], "new_api_error");
+            assert!(error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("test-hub"));
+            assert!(!merged.contains("event: message_stop"));
+        }
+    }
+
+    #[tokio::test]
     async fn test_response_failed_event_becomes_anthropic_error() {
         let input = concat!(
             "event: response.created\n",
@@ -6406,7 +6438,11 @@ mod tests {
         }));
         assert!(events.iter().any(|event| {
             event.get("type").and_then(Value::as_str) == Some("error")
-                && event.pointer("/error/type").and_then(Value::as_str) == Some("stream_truncated")
+                && event.pointer("/error/type").and_then(Value::as_str) == Some("api_error")
+                && event
+                    .pointer("/error/upstream_type")
+                    .and_then(Value::as_str)
+                    == Some("stream_truncated")
         }));
         assert!(!merged.contains("event: message_stop"));
     }
@@ -6477,7 +6513,11 @@ mod tests {
         }));
         assert!(events.iter().any(|event| {
             event.get("type").and_then(Value::as_str) == Some("error")
-                && event.pointer("/error/type").and_then(Value::as_str) == Some("stream_truncated")
+                && event.pointer("/error/type").and_then(Value::as_str) == Some("api_error")
+                && event
+                    .pointer("/error/upstream_type")
+                    .and_then(Value::as_str)
+                    == Some("stream_truncated")
         }));
         assert!(!merged.contains("event: message_stop"));
     }

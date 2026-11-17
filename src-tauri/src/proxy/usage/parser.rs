@@ -199,7 +199,9 @@ impl TokenUsage {
                                 claude_cache_creation_1h_tokens(msg_usage);
                         }
                     }
-                    "message_delta" => {
+                    // A converted failed Responses terminal may carry real usage
+                    // on its error event; retain it without claiming success.
+                    "message_delta" | "error" => {
                         if let Some(delta_usage) = event.get("usage") {
                             // 从 message_delta 获取 output_tokens
                             if let Some(output) =
