@@ -25,6 +25,8 @@ export function AutoFailoverConfigPanel({
   const [formData, setFormData] = useState({
     autoFailoverEnabled: false,
     maxRetries: "3",
+    providerRetries: "0",
+    providerRetryBackoffMs: "1000",
     streamingFirstByteTimeout: "60",
     streamingIdleTimeout: "120",
     nonStreamingTimeout: "600",
@@ -40,6 +42,8 @@ export function AutoFailoverConfigPanel({
       setFormData({
         autoFailoverEnabled: config.autoFailoverEnabled,
         maxRetries: String(config.maxRetries),
+        providerRetries: String(config.providerRetries),
+        providerRetryBackoffMs: String(config.providerRetryBackoffMs),
         streamingFirstByteTimeout: String(config.streamingFirstByteTimeout),
         streamingIdleTimeout: String(config.streamingIdleTimeout),
         nonStreamingTimeout: String(config.nonStreamingTimeout),
@@ -66,11 +70,13 @@ export function AutoFailoverConfigPanel({
 
     // 定义各字段的有效范围
     const ranges = {
-      maxRetries: { min: 0, max: 10 },
+      maxRetries: { min: 0, max: 4294967295 },
+      providerRetries: { min: 0, max: 4294967295 },
+      providerRetryBackoffMs: { min: 0, max: 3600000 },
       streamingFirstByteTimeout: { min: 1, max: 120 },
       streamingIdleTimeout: { min: 0, max: 600 },
       nonStreamingTimeout: { min: 60, max: 1200 },
-      circuitFailureThreshold: { min: 1, max: 20 },
+      circuitFailureThreshold: { min: 1, max: 4294967295 },
       circuitSuccessThreshold: { min: 1, max: 10 },
       circuitTimeoutSeconds: { min: 0, max: 300 },
       circuitErrorRateThreshold: { min: 0, max: 100 },
@@ -80,6 +86,8 @@ export function AutoFailoverConfigPanel({
     // 解析原始值
     const raw = {
       maxRetries: parseNum(formData.maxRetries),
+      providerRetries: parseNum(formData.providerRetries),
+      providerRetryBackoffMs: parseNum(formData.providerRetryBackoffMs),
       streamingFirstByteTimeout: parseNum(formData.streamingFirstByteTimeout),
       streamingIdleTimeout: parseNum(formData.streamingIdleTimeout),
       nonStreamingTimeout: parseNum(formData.nonStreamingTimeout),
@@ -106,6 +114,16 @@ export function AutoFailoverConfigPanel({
       raw.maxRetries,
       ranges.maxRetries,
       t("proxy.autoFailover.maxRetries", "最大重试次数"),
+    );
+    checkRange(
+      raw.providerRetries,
+      ranges.providerRetries,
+      t("proxy.autoFailover.providerRetries", "同一供应商重试次数"),
+    );
+    checkRange(
+      raw.providerRetryBackoffMs,
+      ranges.providerRetryBackoffMs,
+      t("proxy.autoFailover.providerRetryBackoffMs", "重试退避基数"),
     );
     checkRange(
       raw.streamingFirstByteTimeout,
@@ -164,6 +182,8 @@ export function AutoFailoverConfigPanel({
         enabled: config.enabled,
         autoFailoverEnabled: formData.autoFailoverEnabled,
         maxRetries: raw.maxRetries,
+        providerRetries: raw.providerRetries,
+        providerRetryBackoffMs: raw.providerRetryBackoffMs,
         streamingFirstByteTimeout: raw.streamingFirstByteTimeout,
         streamingIdleTimeout: raw.streamingIdleTimeout,
         nonStreamingTimeout: raw.nonStreamingTimeout,
@@ -189,6 +209,8 @@ export function AutoFailoverConfigPanel({
       setFormData({
         autoFailoverEnabled: config.autoFailoverEnabled,
         maxRetries: String(config.maxRetries),
+        providerRetries: String(config.providerRetries),
+        providerRetryBackoffMs: String(config.providerRetryBackoffMs),
         streamingFirstByteTimeout: String(config.streamingFirstByteTimeout),
         streamingIdleTimeout: String(config.streamingIdleTimeout),
         nonStreamingTimeout: String(config.nonStreamingTimeout),
@@ -247,7 +269,6 @@ export function AutoFailoverConfigPanel({
                 id={`maxRetries-${appType}`}
                 type="number"
                 min="0"
-                max="10"
                 value={formData.maxRetries}
                 onChange={(e) =>
                   setFormData({ ...formData, maxRetries: e.target.value })
@@ -257,7 +278,58 @@ export function AutoFailoverConfigPanel({
               <p className="text-xs text-fg-2">
                 {t(
                   "proxy.autoFailover.maxRetriesHint",
-                  "请求失败时的重试次数（0-10）",
+                  "故障转移时最多尝试几个供应商（无上限）",
+                )}
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor={`providerRetries-${appType}`}>
+                {t("proxy.autoFailover.providerRetries", "同一供应商重试次数")}
+              </Label>
+              <Input
+                id={`providerRetries-${appType}`}
+                type="number"
+                min="0"
+                value={formData.providerRetries}
+                onChange={(e) =>
+                  setFormData({ ...formData, providerRetries: e.target.value })
+                }
+                disabled={isDisabled}
+              />
+              <p className="text-xs text-fg-2">
+                {t(
+                  "proxy.autoFailover.providerRetriesHint",
+                  "失败后先对同一供应商原地重试，用尽后再切换供应商（单账号路由也生效）",
+                )}
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor={`providerRetryBackoff-${appType}`}>
+                {t(
+                  "proxy.autoFailover.providerRetryBackoffMs",
+                  "重试退避基数（毫秒）",
+                )}
+              </Label>
+              <Input
+                id={`providerRetryBackoff-${appType}`}
+                type="number"
+                min="0"
+                max="3600000"
+                value={formData.providerRetryBackoffMs}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    providerRetryBackoffMs: e.target.value,
+                  })
+                }
+                disabled={isDisabled}
+              />
+              <p className="text-xs text-fg-2">
+                {t(
+                  "proxy.autoFailover.providerRetryBackoffHint",
+                  "按 基数×2^(n-1) 递增，0 表示立即重试",
                 )}
               </p>
             </div>
@@ -270,7 +342,6 @@ export function AutoFailoverConfigPanel({
                 id={`failureThreshold-${appType}`}
                 type="number"
                 min="1"
-                max="20"
                 value={formData.circuitFailureThreshold}
                 onChange={(e) =>
                   setFormData({
@@ -283,7 +354,7 @@ export function AutoFailoverConfigPanel({
               <p className="text-xs text-fg-2">
                 {t(
                   "proxy.autoFailover.failureThresholdHint",
-                  "连续失败多少次后打开熔断器（建议: 3-10）",
+                  "连续失败多少次后打开熔断器（无上限，建议 3-10）",
                 )}
               </p>
             </div>

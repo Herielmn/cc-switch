@@ -136,7 +136,9 @@ impl Database {
             proxy_enabled INTEGER NOT NULL DEFAULT 0, listen_address TEXT NOT NULL DEFAULT '127.0.0.1',
             listen_port INTEGER NOT NULL DEFAULT 15721, enable_logging INTEGER NOT NULL DEFAULT 1,
             enabled INTEGER NOT NULL DEFAULT 0, auto_failover_enabled INTEGER NOT NULL DEFAULT 0,
-            max_retries INTEGER NOT NULL DEFAULT 3, streaming_first_byte_timeout INTEGER NOT NULL DEFAULT 60,
+            max_retries INTEGER NOT NULL DEFAULT 3, provider_retries INTEGER NOT NULL DEFAULT 0,
+            provider_retry_backoff_ms INTEGER NOT NULL DEFAULT 1000,
+            streaming_first_byte_timeout INTEGER NOT NULL DEFAULT 60,
             streaming_idle_timeout INTEGER NOT NULL DEFAULT 120, non_streaming_timeout INTEGER NOT NULL DEFAULT 600,
             circuit_failure_threshold INTEGER NOT NULL DEFAULT 4, circuit_success_threshold INTEGER NOT NULL DEFAULT 2,
             circuit_timeout_seconds INTEGER NOT NULL DEFAULT 60, circuit_error_rate_threshold REAL NOT NULL DEFAULT 0.6,
@@ -620,6 +622,23 @@ impl Database {
                         }
                         Self::set_user_version(conn, 23)?;
                     }
+                    23 => {
+                        log::info!("迁移数据库从 v23 到 v24（供应商内重试配置）");
+                        for (column, definition) in [
+                            ("provider_retries", "INTEGER NOT NULL DEFAULT 0"),
+                            ("provider_retry_backoff_ms", "INTEGER NOT NULL DEFAULT 1000"),
+                        ] {
+                            if Self::table_exists(conn, "proxy_config")? {
+                                Self::add_column_if_missing(
+                                    conn,
+                                    "proxy_config",
+                                    column,
+                                    definition,
+                                )?;
+                            }
+                        }
+                        Self::set_user_version(conn, 24)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -955,7 +974,9 @@ impl Database {
             proxy_enabled INTEGER NOT NULL DEFAULT 0, listen_address TEXT NOT NULL DEFAULT '127.0.0.1',
             listen_port INTEGER NOT NULL DEFAULT 15721, enable_logging INTEGER NOT NULL DEFAULT 1,
             enabled INTEGER NOT NULL DEFAULT 0, auto_failover_enabled INTEGER NOT NULL DEFAULT 0,
-            max_retries INTEGER NOT NULL DEFAULT 3, streaming_first_byte_timeout INTEGER NOT NULL DEFAULT 60,
+            max_retries INTEGER NOT NULL DEFAULT 3, provider_retries INTEGER NOT NULL DEFAULT 0,
+            provider_retry_backoff_ms INTEGER NOT NULL DEFAULT 1000,
+            streaming_first_byte_timeout INTEGER NOT NULL DEFAULT 60,
             streaming_idle_timeout INTEGER NOT NULL DEFAULT 120, non_streaming_timeout INTEGER NOT NULL DEFAULT 600,
             circuit_failure_threshold INTEGER NOT NULL DEFAULT 4, circuit_success_threshold INTEGER NOT NULL DEFAULT 2,
             circuit_timeout_seconds INTEGER NOT NULL DEFAULT 60, circuit_error_rate_threshold REAL NOT NULL DEFAULT 0.6,
@@ -1521,6 +1542,8 @@ impl Database {
                 enabled INTEGER NOT NULL DEFAULT 0,
                 auto_failover_enabled INTEGER NOT NULL DEFAULT 0,
                 max_retries INTEGER NOT NULL DEFAULT 3,
+                provider_retries INTEGER NOT NULL DEFAULT 0,
+                provider_retry_backoff_ms INTEGER NOT NULL DEFAULT 1000,
                 streaming_first_byte_timeout INTEGER NOT NULL DEFAULT 60,
                 streaming_idle_timeout INTEGER NOT NULL DEFAULT 120,
                 non_streaming_timeout INTEGER NOT NULL DEFAULT 600,
@@ -1548,6 +1571,8 @@ impl Database {
             ("enabled", "0"),
             ("auto_failover_enabled", "0"),
             ("max_retries", "3"),
+            ("provider_retries", "0"),
+            ("provider_retry_backoff_ms", "1000"),
             ("streaming_first_byte_timeout", "60"),
             ("streaming_idle_timeout", "120"),
             ("non_streaming_timeout", "600"),
@@ -1579,6 +1604,7 @@ impl Database {
             "INSERT INTO proxy_config_v14 (
                 app_type, proxy_enabled, listen_address, listen_port, enable_logging,
                 enabled, auto_failover_enabled, max_retries,
+                provider_retries, provider_retry_backoff_ms,
                 streaming_first_byte_timeout, streaming_idle_timeout, non_streaming_timeout,
                 circuit_failure_threshold, circuit_success_threshold, circuit_timeout_seconds,
                 circuit_error_rate_threshold, circuit_min_requests,

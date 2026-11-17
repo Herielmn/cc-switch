@@ -244,6 +244,10 @@ export interface AppProxyConfig {
   enabled: boolean;
   autoFailoverEnabled: boolean;
   maxRetries: number;
+  /** 同一供应商内的重试次数（失败后原地重试，不切换供应商） */
+  providerRetries: number;
+  /** 同供应商重试的指数退避基数（毫秒），0 表示立即重试 */
+  providerRetryBackoffMs: number;
   streamingFirstByteTimeout: number;
   streamingIdleTimeout: number;
   nonStreamingTimeout: number;

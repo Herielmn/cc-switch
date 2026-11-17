@@ -168,8 +168,14 @@ pub struct AppProxyConfig {
     pub enabled: bool,
     /// 该 app 自动故障转移开关
     pub auto_failover_enabled: bool,
-    /// 最大重试次数
+    /// 故障转移时最多尝试多少个供应商（含首家）
     pub max_retries: u32,
+    /// 同一供应商内的重试次数（失败后原地重试，不切换供应商）
+    #[serde(default)]
+    pub provider_retries: u32,
+    /// 同一供应商重试的指数退避基数（毫秒），0 表示立即重试
+    #[serde(default)]
+    pub provider_retry_backoff_ms: u32,
     /// 流式首字超时（秒）
     pub streaming_first_byte_timeout: u32,
     /// 流式静默超时（秒）
