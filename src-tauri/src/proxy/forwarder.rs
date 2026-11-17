@@ -383,10 +383,14 @@ pub struct RequestForwarder {
     streaming_first_byte_timeout: std::time::Duration,
     /// 单个客户端请求最多尝试的 provider 数。
     ///
-    /// 由 `AppProxyConfig.max_retries` (UI: "请求失败时的重试次数, 0-10") 派生：
-    /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
-    /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
+    /// 由 `AppProxyConfig.max_retries` 派生：`max_attempts = max_retries + 1`，
+    /// 所以 max_retries=0 表示仅尝试一家、max_retries=3（默认）表示最多 4 家。
+    /// loop 同时受 providers.len() 自然限制。
     max_attempts: usize,
+    /// 同一供应商内的重试次数（失败后原地重试，不切换供应商）。
+    provider_retries: u32,
+    /// 同一供应商重试的指数退避基数（毫秒），0 表示不等待。
+    provider_retry_backoff: std::time::Duration,
     /// Stack 模型的请求（`mode::stack`）：挂在结构体上，整流器重试再次调用 `forward()` 时照样
     /// 生效。见 [`Self::routing_state_enabled`]。
     stack_request: bool,
@@ -516,6 +520,8 @@ impl RequestForwarder {
         optimizer_config: OptimizerConfig,
         copilot_optimizer_config: CopilotOptimizerConfig,
         max_retries: u32,
+        provider_retries: u32,
+        provider_retry_backoff_ms: u32,
     ) -> Self {
         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
         // saturating_add 防止 u32::MAX + 1 溢出。
@@ -539,6 +545,10 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            provider_retries,
+            provider_retry_backoff: std::time::Duration::from_millis(
+                provider_retry_backoff_ms as u64,
+            ),
             stack_request: false,
             failover_chain: false,
             last_outbound_model: std::sync::Mutex::new(None),
@@ -958,12 +968,33 @@ impl RequestForwarder {
         let mut last_error = None;
         let mut last_provider = None;
         let mut attempted_providers = 0usize;
+        // 同一供应商内已尝试次数；原地重试时不清零。
+        let mut provider_attempts = 0u32;
+        // Keep the upstream RAII permit alive across same-provider retries, so
+        // cancellation releases the HalfOpen probe even during backoff.
+        let mut _half_open_permit = None;
+        let mut used_half_open_permit = false;
+        // 上一次实际发起请求的 provider 下标：与本次相同即为原地重试。
+        // 用下标而不是布尔标记，任何「换下一家」的 continue 都不会把重试状态带过去。
+        let mut last_attempted_slot: Option<usize> = None;
 
         // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）；Stack 模型的请求不碰熔断器。
         let bypass_circuit_breaker = providers.len() == 1 || !self.routing_state_enabled();
 
-        // 依次尝试每个供应商
-        for provider in providers.iter() {
+        // 依次尝试每个供应商；同一供应商内可原地重试，不推进 providers 索引。
+        let mut provider_index = 0usize;
+        while provider_index < providers.len() {
+            let provider = &providers[provider_index];
+            let is_same_provider_retry = last_attempted_slot == Some(provider_index);
+            last_attempted_slot = Some(provider_index);
+            provider_index += 1;
+            // 换到下一家：重置本家重试计数，并丢弃上一家的许可标记。
+            // 原地重试则保留计数，继续复用同一张 HalfOpen 探测许可。
+            if !is_same_provider_retry {
+                provider_attempts = 0;
+                _half_open_permit = None;
+                used_half_open_permit = false;
+            }
             // 整流器重试标记：每个 provider 独立持有，避免标记跨 provider 短路故障转移
             // —— 首家 provider 整流后被 5xx/timeout 击落时，下家仍能用整流后的请求体走整流流程
             let mut rectifier_retried = false;
@@ -972,8 +1003,10 @@ impl RequestForwarder {
             let mut opaque_rectifier_retried = false;
 
             // 上限检查：尊重用户在 AppProxyConfig.max_retries 上配置的「重试次数」。
+            // 只限制换家次数；同一家原地重试不推进 attempted_providers，不应被它卡住
+            // （否则 max_retries=0 + provider_retries>0 的组合会一次都不重试）。
             // 放在熔断器 allow 检查之前，避免在已经超限时还占用 HalfOpen 探测名额。
-            if attempted_providers >= self.max_attempts {
+            if !is_same_provider_retry && attempted_providers >= self.max_attempts {
                 log::warn!(
                     "[{app_type_str}] 已达最大尝试次数上限 ({}/{}), 停止故障转移",
                     attempted_providers,
@@ -983,17 +1016,18 @@ impl RequestForwarder {
             }
 
             // 发起请求前先获取熔断器放行许可（HalfOpen 会占用探测名额）
-            // 单 Provider 场景下跳过此检查，避免熔断器阻塞所有请求
-            // 占用了 HalfOpen 名额时，`_half_open_permit` 一直持有到这次尝试结束（continue /
-            // return，或客户端断开把整个 future 丢掉），drop 时归还名额。
-            let (allowed, used_half_open_permit, _half_open_permit) = if bypass_circuit_breaker {
-                (true, false, None)
+            // Same-provider retries reuse the permit; changing providers drops it.
+            let allowed = if is_same_provider_retry || bypass_circuit_breaker {
+                true
             } else {
                 let permit = self
                     .router
                     .allow_provider_request(&provider.id, app_type_str)
                     .await;
-                (permit.allowed, permit.used_half_open_permit, Some(permit))
+                let allowed = permit.allowed;
+                used_half_open_permit = permit.used_half_open_permit;
+                _half_open_permit = Some(permit);
+                allowed
             };
 
             if !allowed {
@@ -1023,7 +1057,10 @@ impl RequestForwarder {
                 }
             }
 
-            attempted_providers += 1;
+            if !is_same_provider_retry {
+                attempted_providers += 1;
+            }
+            provider_attempts = provider_attempts.saturating_add(1);
 
             // 更新状态中的当前 Provider 信息（per-attempt 维度的标识）
             //
@@ -1032,7 +1069,7 @@ impl RequestForwarder {
             // 新「正在尝试哪个 provider」的展示字段。
             self.note_attempt(provider).await;
 
-            // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
+            // 转发请求（同一 Provider 的可重试错误由本轮循环原地重试）
             let mut attempted_codex_upstream_format = None;
             match self
                 .forward(
@@ -1476,15 +1513,8 @@ impl RequestForwarder {
 
                     match category {
                         ErrorCategory::Retryable => {
-                            // 可重试：真正的 provider 故障 → 记录失败并更新熔断器/DB 健康度
-                            self.record_provider_failure(
-                                provider,
-                                app_type_str,
-                                &e,
-                                format!("Provider {} 失败: {}", provider.name, e),
-                            )
-                            .await;
-
+                            // 可重试错误：每次失败都记一条 warn，便于排查上游状态；
+                            // 健康度/熔断只在本家重试全部用尽后记一次，避免一次故障被放大成 N 次。
                             let (log_code, log_message) = build_retryable_failure_log(
                                 &provider.name,
                                 attempted_providers,
@@ -1493,9 +1523,41 @@ impl RequestForwarder {
                             );
                             log::warn!("[{app_type_str}] [{log_code}] {log_message}");
 
+                            // 同一供应商内重试：可重试错误先在本家退避重试，
+                            // 用尽 provider_retries 后才记失败并切换到下一家供应商。
+                            if provider_attempts <= self.provider_retries {
+                                // 指数退避：基数 × 2^(n-1)，单次最长 60 秒，
+                                // 避免基数很大时退避时间失控。
+                                let factor = 1u32 << (provider_attempts - 1).min(16);
+                                let delay = self
+                                    .provider_retry_backoff
+                                    .saturating_mul(factor)
+                                    .min(std::time::Duration::from_secs(60));
+                                if !delay.is_zero() {
+                                    log::info!(
+                                        "[{app_type_str}] [FWD-009] provider={} 第 {}/{} 次原地重试，退避 {} ms",
+                                        provider.id,
+                                        provider_attempts,
+                                        self.provider_retries,
+                                        delay.as_millis()
+                                    );
+                                    tokio::time::sleep(delay).await;
+                                }
+                                // 原地重试同一家：回退索引，下一轮仍是这个 provider。
+                                provider_index -= 1;
+                                continue;
+                            }
+
+                            self.record_provider_failure(
+                                provider,
+                                app_type_str,
+                                &e,
+                                format!("Provider {} 失败: {}", provider.name, e),
+                            )
+                            .await;
                             last_error = Some(e);
                             last_provider = Some(provider.clone());
-                            // 继续尝试下一个供应商
+                            // 本家重试次数用尽，继续尝试下一个供应商。
                             continue;
                         }
                         ErrorCategory::NonRetryable => {
@@ -5145,6 +5207,8 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            provider_retries: 0,
+            provider_retry_backoff: Duration::from_millis(0),
             stack_request: false,
             failover_chain: false,
             last_outbound_model: std::sync::Mutex::new(None),

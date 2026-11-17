@@ -282,6 +282,11 @@ impl RequestContext {
             0
         };
 
+        // 同一供应商内的重试不受故障转移开关影响：它不切换供应商，
+        // 单账号路由也能在限流/瞬时故障后原地重试。
+        let provider_retries = self.app_config.provider_retries;
+        let provider_retry_backoff_ms = self.app_config.provider_retry_backoff_ms;
+
         RequestForwarder::new(
             state.provider_router.clone(),
             non_streaming_timeout,
@@ -300,6 +305,8 @@ impl RequestContext {
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
+            provider_retries,
+            provider_retry_backoff_ms,
         )
         .stack_request(self.is_stack)
         .failover_chain(self.app_config.auto_failover_enabled)
