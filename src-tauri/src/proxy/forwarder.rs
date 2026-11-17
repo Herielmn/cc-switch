@@ -3287,7 +3287,9 @@ impl RequestForwarder {
         };
 
         if let Some(error) = responses_error_envelope(&decoded) {
-            if let Some(rejection) = responses_envelope_opaque_rejection(&decoded, &self.rectifier_config) {
+            if let Some(rejection) =
+                responses_envelope_opaque_rejection(&decoded, &self.rectifier_config)
+            {
                 return Err(rejection);
             }
             return Err(error);
@@ -3323,13 +3325,17 @@ impl RequestForwarder {
             };
 
             let Some(chunk) = next else {
-                if let Some(outcome) = inspect_responses_json_document(sse.pending(), &self.rectifier_config) {
+                if let Some(outcome) =
+                    inspect_responses_json_document(sse.pending(), &self.rectifier_config)
+                {
                     outcome?;
                     let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                     return Ok(ProxyResponse::streamed(status, headers, replay));
                 }
                 if !sse.pending().trim().is_empty() {
-                    if let Some(outcome) = inspect_responses_start_event(sse.pending().trim(), &self.rectifier_config) {
+                    if let Some(outcome) =
+                        inspect_responses_start_event(sse.pending().trim(), &self.rectifier_config)
+                    {
                         outcome?;
                         let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok));
                         return Ok(ProxyResponse::streamed(status, headers, replay));
@@ -3352,14 +3358,17 @@ impl RequestForwarder {
             // Responses JSON document without a JSON content-type. Recognize that
             // shape before looking for SSE delimiters; pretty-printed JSON may itself
             // contain blank lines and must stay intact.
-            if let Some(outcome) = inspect_responses_json_document(sse.pending(), &self.rectifier_config) {
+            if let Some(outcome) =
+                inspect_responses_json_document(sse.pending(), &self.rectifier_config)
+            {
                 outcome?;
                 let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
                 return Ok(ProxyResponse::streamed(status, headers, replay));
             }
 
             while let Some(block) = sse.next_block() {
-                if let Some(outcome) = inspect_responses_start_event(block, &self.rectifier_config) {
+                if let Some(outcome) = inspect_responses_start_event(block, &self.rectifier_config)
+                {
                     outcome?;
                     let replay =
                         futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
@@ -4145,14 +4154,19 @@ fn opaque_state_stream_start(
 /// A streaming request may receive a whole JSON document even when the gateway
 /// omits `application/json`. `None` means either "not JSON" or "not complete yet";
 /// a parsed document is safe to commit unless it is a semantic failure envelope.
-fn inspect_responses_json_document(buffer: &str, rectifier_config: &RectifierConfig) -> Option<Result<(), ProxyError>> {
+fn inspect_responses_json_document(
+    buffer: &str,
+    rectifier_config: &RectifierConfig,
+) -> Option<Result<(), ProxyError>> {
     let trimmed = buffer.trim();
     if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
         return None;
     }
     let value: Value = serde_json::from_str(trimmed).ok()?;
     if let Some(error) = ProxyError::from_responses_failure(&value) {
-        if let Some(rejection) = responses_envelope_opaque_rejection(trimmed.as_bytes(), rectifier_config) {
+        if let Some(rejection) =
+            responses_envelope_opaque_rejection(trimmed.as_bytes(), rectifier_config)
+        {
             return Some(Err(rejection));
         }
         return Some(Err(error));
@@ -4163,11 +4177,17 @@ fn inspect_responses_json_document(buffer: &str, rectifier_config: &RectifierCon
 /// 有些网关先回 HTTP 200，再在输出前（或 2xx 的 Response 对象里）说验不了请求里的密文
 /// （#9424）。这种失败改成上游 400，回到重试循环和 HTTP 报错一样做密文整流；
 /// 其余失败照旧当转换错误，可以换下一家。
-fn opaque_rejection_before_output(error: &Value, rectifier_config: &RectifierConfig) -> Option<ProxyError> {
+fn opaque_rejection_before_output(
+    error: &Value,
+    rectifier_config: &RectifierConfig,
+) -> Option<ProxyError> {
     super::opaque_state_rectifier::in_stream_rejection(error, &Value::Null, rectifier_config)
 }
 
-fn responses_envelope_opaque_rejection(body: &[u8], rectifier_config: &RectifierConfig) -> Option<ProxyError> {
+fn responses_envelope_opaque_rejection(
+    body: &[u8],
+    rectifier_config: &RectifierConfig,
+) -> Option<ProxyError> {
     let value: Value = serde_json::from_slice(body).ok()?;
     value
         .get("error")
@@ -4178,7 +4198,10 @@ fn responses_envelope_opaque_rejection(body: &[u8], rectifier_config: &Rectifier
 /// Inspect one complete Responses SSE block while the response is still inside
 /// the retry loop. `None` means the event is lifecycle-only and priming should
 /// continue; `Some(Ok(()))` means it is safe to commit/replay the stream.
-fn inspect_responses_start_event(block: &str, rectifier_config: &RectifierConfig) -> Option<Result<(), ProxyError>> {
+fn inspect_responses_start_event(
+    block: &str,
+    rectifier_config: &RectifierConfig,
+) -> Option<Result<(), ProxyError>> {
     let mut named_event = None;
     let mut data_lines = Vec::new();
     for line in block.lines() {
@@ -5997,18 +6020,19 @@ mod tests {
 
     #[test]
     fn responses_stream_start_semantic_failure_is_retryable() {
+        let config = RectifierConfig::default();
         let created = concat!(
             "event: response.created\n",
             "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}"
         );
-        assert!(inspect_responses_start_event(created).is_none());
+        assert!(inspect_responses_start_event(created, &config).is_none());
 
         let failed = concat!(
             "event: response.failed\n",
             "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}}"
         );
         assert!(matches!(
-            inspect_responses_start_event(failed),
+            inspect_responses_start_event(failed, &config),
             Some(Err(ProxyError::UpstreamError { status: 502, body: Some(message) })) if message.contains("boom")
         ));
 
@@ -6016,12 +6040,16 @@ mod tests {
             "event: response.output_text.delta\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}"
         );
-        assert!(matches!(inspect_responses_start_event(delta), Some(Ok(()))));
+        assert!(matches!(
+            inspect_responses_start_event(delta, &config),
+            Some(Ok(()))
+        ));
     }
 
     /// 输出前说验不了密文（#9424）：改成上游 400，回到重试循环做密文整流，不当转换错误换家。
     #[test]
     fn responses_stream_start_opaque_rejection_becomes_upstream_error() {
+        let config = RectifierConfig::default();
         let foreign_resource = concat!(
             "event: response.failed\n",
             "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The requested item was created under a different Azure OpenAI resource.\"}}}"
@@ -6029,7 +6057,7 @@ mod tests {
         let Some(Err(ProxyError::UpstreamError {
             status: 400,
             body: Some(body),
-        })) = inspect_responses_start_event(foreign_resource)
+        })) = inspect_responses_start_event(foreign_resource, &config)
         else {
             panic!("expected an upstream 400");
         };
@@ -6040,13 +6068,14 @@ mod tests {
             "data: {\"type\":\"error\",\"error\":{\"code\":\"invalid_encrypted_content\",\"message\":\"bad\"}}"
         );
         assert!(matches!(
-            inspect_responses_start_event(error_event),
+            inspect_responses_start_event(error_event, &config),
             Some(Err(ProxyError::UpstreamError { status: 400, .. }))
         ));
 
         assert!(matches!(
             inspect_responses_json_document(
-                r#"{"status":"failed","error":{"code":"invalid_encrypted_content","message":"bad"}}"#
+                r#"{"status":"failed","error":{"code":"invalid_encrypted_content","message":"bad"}}"#,
+                &config,
             ),
             Some(Err(ProxyError::UpstreamError { status: 400, .. }))
         ));
@@ -6054,24 +6083,45 @@ mod tests {
 
     #[test]
     fn responses_stream_start_accepts_unlabelled_whole_json() {
+        let config = RectifierConfig::default();
         assert!(matches!(
             inspect_responses_json_document(
                 r#"{
                     "status": "completed",
 
                     "output": []
-                }"#
+                }"#,
+                &config,
             ),
             Some(Ok(()))
         ));
-        assert!(inspect_responses_json_document(r#"{"status":"completed""#).is_none());
+        assert!(inspect_responses_json_document(r#"{"status":"completed""#, &config).is_none());
 
         let failed = inspect_responses_json_document(
             r#"{"status":"failed","error":{"message":"backend unavailable"}}"#,
+            &config,
         );
         assert!(
             matches!(failed, Some(Err(ProxyError::UpstreamError { status: 502, body: Some(message) })) if message.contains("backend unavailable"))
         );
+    }
+
+    #[test]
+    fn responses_pre_output_azure_rejection_honors_independent_switch() {
+        let enabled = RectifierConfig::default();
+        let disabled = RectifierConfig {
+            request_azure_foreign_resource_strip: false,
+            ..enabled.clone()
+        };
+        let error = json!({
+            "type": "invalid_request_error",
+            "message": "The requested item was created under a different Azure OpenAI resource."
+        });
+        assert!(opaque_rejection_before_output(&error, &enabled).is_some());
+        assert!(opaque_rejection_before_output(&error, &disabled).is_none());
+        let body = json!({ "status": "failed", "error": error }).to_string();
+        assert!(responses_envelope_opaque_rejection(body.as_bytes(), &enabled).is_some());
+        assert!(responses_envelope_opaque_rejection(body.as_bytes(), &disabled).is_none());
     }
 
     #[test]
@@ -9781,6 +9831,51 @@ mod tests {
                     "status {status}"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn same_provider_retry_precedes_failover_and_keeps_provider_budget() {
+            let up1 = upstream(vec![error(500, "busy"), ok()]).await;
+            let up2 = upstream(vec![ok()]).await;
+            let mut fwd = forwarder(1, "p1");
+            fwd.provider_retries = 1;
+            fwd.provider_retry_backoff = Duration::ZERO;
+            let result = send(
+                &fwd,
+                vec![provider("p1", &up1), provider("p2", &up2)],
+                plain_body(),
+            )
+            .await
+            .map_err(|e| e.error)
+            .expect("same-provider retry succeeds within one-provider budget");
+            assert_eq!(result.provider.id, "p1");
+            assert_eq!(up1.requests.lock().await.len(), 2);
+            assert_eq!(up2.requests.lock().await.len(), 0);
+            assert_eq!(breaker(&fwd, "p1").await, Some((1, 0)));
+            assert_eq!(books(&fwd).await.failover_count, 0);
+        }
+
+        #[tokio::test]
+        async fn exhausted_provider_retries_fail_over_and_reset_retry_count() {
+            let up1 = upstream(vec![error(500, "busy"), error(503, "still busy")]).await;
+            let up2 = upstream(vec![error(500, "busy"), ok()]).await;
+            let mut fwd = forwarder(2, "p1");
+            fwd.provider_retries = 1;
+            fwd.provider_retry_backoff = Duration::ZERO;
+            let result = send(
+                &fwd,
+                vec![provider("p1", &up1), provider("p2", &up2)],
+                plain_body(),
+            )
+            .await
+            .map_err(|e| e.error)
+            .expect("next provider receives its own retry budget");
+            assert_eq!(result.provider.id, "p2");
+            assert_eq!(up1.requests.lock().await.len(), 2);
+            assert_eq!(up2.requests.lock().await.len(), 2);
+            assert_eq!(breaker(&fwd, "p1").await, Some((1, 1)));
+            assert_eq!(breaker(&fwd, "p2").await, Some((1, 0)));
+            assert_eq!(books(&fwd).await.failover_count, 1);
         }
 
         #[tokio::test]

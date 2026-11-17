@@ -166,7 +166,7 @@ pub fn in_stream_rejection(
     let foreign_resource = messages
         .iter()
         .any(|message| is_foreign_resource_rejection(message));
-    (rejected && !(foreign_resource && !config.request_azure_foreign_resource_strip)).then(|| {
+    (rejected && (!foreign_resource || config.request_azure_foreign_resource_strip)).then(|| {
         ProxyError::UpstreamError {
             status: 400,
             body: Some(body.clone()),

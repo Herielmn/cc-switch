@@ -4094,6 +4094,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_retry_columns_upgrade_old_and_current_upstream_databases() -> Result<(), AppError> {
+        for version in [23, SCHEMA_VERSION] {
+            let conn = Connection::open_in_memory()?;
+            Database::create_tables_on_conn(&conn)?;
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO proxy_config (app_type, max_retries) VALUES ('claude', 7);
+                 ALTER TABLE proxy_config DROP COLUMN provider_retries;
+                 ALTER TABLE proxy_config DROP COLUMN provider_retry_backoff_ms;",
+            )?;
+            Database::set_user_version(&conn, version)?;
+            Database::create_tables_on_conn(&conn)?;
+            Database::apply_schema_migrations_on_conn(&conn)?;
+            assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+            let settings: (u32, u32, u32) = conn.query_row(
+                "SELECT max_retries, provider_retries, provider_retry_backoff_ms
+                 FROM proxy_config WHERE app_type = 'claude'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(settings, (7, 0, 1000));
+            conn.execute(
+                "UPDATE proxy_config SET provider_retries = 2, provider_retry_backoff_ms = 250",
+                [],
+            )?;
+            Database::create_tables_on_conn(&conn)?;
+            let settings: (u32, u32) = conn.query_row(
+                "SELECT provider_retries, provider_retry_backoff_ms
+                 FROM proxy_config WHERE app_type = 'claude'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(settings, (2, 250));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn migrate_v23_to_v24_preserves_existing_session_cursors() -> Result<(), AppError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(

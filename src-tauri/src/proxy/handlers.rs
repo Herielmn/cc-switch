@@ -680,8 +680,7 @@ async fn handle_claude_transform(
         if api_format == "gemini_native" {
             parser_config.stream_parser = TokenUsage::from_converted_claude_stream_events;
         }
-        let usage_collector =
-            create_usage_collector(ctx, state, status.as_u16(), &parser_config);
+        let usage_collector = create_usage_collector(ctx, state, status.as_u16(), &parser_config);
 
         // 获取流式超时配置
         let timeout_config = ctx.streaming_timeout_config();
@@ -4348,7 +4347,15 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         let sse = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstream failed\"}}}\n\n";
 
         let err = responses_sse_to_response_value(sse).unwrap_err();
-        assert!(matches!(err, ProxyError::TransformError(message) if message == "upstream failed"));
+        let ProxyError::UpstreamError {
+            status: 502,
+            body: Some(body),
+        } = err
+        else {
+            panic!("expected an upstream 502 failure");
+        };
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["message"], "upstream failed");
     }
 
     #[test]
@@ -4359,7 +4366,15 @@ data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\"}}\n
         );
 
         let err = responses_sse_to_response_value(sse).unwrap_err();
-        assert!(matches!(err, ProxyError::TransformError(message) if message == "upstream failed"));
+        let ProxyError::UpstreamError {
+            status: 502,
+            body: Some(body),
+        } = err
+        else {
+            panic!("expected an upstream 502 failure");
+        };
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["message"], "upstream failed");
     }
 
     #[test]

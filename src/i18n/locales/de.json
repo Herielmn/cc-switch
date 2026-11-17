@@ -515,7 +515,9 @@
         "mediaFallback": "Fallback bei nicht unterstützten Bildern",
         "mediaFallbackDescription": "Wenn ein Anbieter keine Bildeingabe unterstützt (er deklariert reine Textunterstützung oder der Upstream meldet einen Fehler wegen nicht unterstützter Bilder), werden Bildblöcke automatisch durch die Markierung [Unsupported Image] ersetzt, damit die Unterhaltung nicht unterbrochen wird",
         "mediaHeuristic": "Preflight für reine Textmodelle",
-        "mediaHeuristicDescription": "Entfernt vor dem Senden Bilder für Modelle aus dem integrierten Register bestätigter reiner Textmodelle. Das Ausschalten deaktiviert nur den registerbasierten Preflight des Proxys; die Behandlung deklarierter reiner Textmodelle und der Fallback bei Upstream-Fehlern bleiben bestehen, und die Fähigkeitsangaben im Codex-Modellkatalog bleiben unverändert"
+        "mediaHeuristicDescription": "Entfernt vor dem Senden Bilder für Modelle aus dem integrierten Register bestätigter reiner Textmodelle. Das Ausschalten deaktiviert nur den registerbasierten Preflight des Proxys; die Behandlung deklarierter reiner Textmodelle und der Fallback bei Upstream-Fehlern bleiben bestehen, und die Fähigkeitsangaben im Codex-Modellkatalog bleiben unverändert",
+        "azureForeignResourceStrip": "IDs von Elementen anderer Azure-Ressourcen entfernen",
+        "azureForeignResourceStripDescription": "Wenn Azure meldet, dass ein Element unter einer anderen Azure-OpenAI-Ressource erstellt wurde, werden die IDs der Eingabeelemente entfernt und die Anfrage einmal beim selben Anbieter wiederholt. Deaktiviert wird der Fehler unverändert zurückgegeben, ohne IDs zu entfernen oder die Anfrage zu wiederholen."
       },
       "privacyFilter": {
         "title": "Datenschutzfilter",
@@ -3978,7 +3980,11 @@
       "streamingFirstByte": "Streaming-Timeout für das erste Byte",
       "streamingIdle": "Streaming-Leerlauf-Timeout",
       "nonStreaming": "Nicht-Streaming-Timeout",
-      "maxRetriesHint": "Anzahl der Wiederholungen bei fehlgeschlagener Anfrage (0–10)",
+      "maxRetriesHint": "Maximale Anzahl der Anbieter beim Failover (ohne Obergrenze)",
+      "providerRetries": "Wiederholungen beim selben Anbieter",
+      "providerRetriesHint": "Anfragen beim selben Anbieter wiederholen, bevor zum nächsten gewechselt wird (auch bei Routen mit nur einem Konto)",
+      "providerRetryBackoffMs": "Basis der Wiederholungsverzögerung (ms)",
+      "providerRetryBackoffHint": "Steigt als Basis x 2^(n-1); 0 wiederholt sofort",
       "streamingFirstByteHint": "Maximale Wartezeit auf den ersten Datenblock, Bereich 1–120 s, Standard 60 s",
       "streamingIdleHint": "Maximales Intervall zwischen Datenblöcken, Bereich 60–600 s, 0 zum Deaktivieren (verhindert Stillstand mitten im Stream)",
       "nonStreamingHint": "Gesamt-Timeout für Nicht-Streaming-Anfragen, Bereich 60–1200 s, Standard 600 s (10 Min.)"
